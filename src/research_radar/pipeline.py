@@ -290,15 +290,12 @@ def detect_source_type(url, feed="", categories=None):
     return "other"
 
 
-def parse_timestamp(value):
+def parse_iso_datetime(value):
+    """Parse ISO-8601 datetime strings to timezone-aware UTC."""
     if value is None:
         return None
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, (int, float)):
-        if value > 10_000_000_000:
-            value /= 1_000_000
-        return datetime.fromtimestamp(value, tz=timezone.utc)
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -311,6 +308,55 @@ def parse_timestamp(value):
         except ValueError:
             return None
     return None
+
+
+def parse_unix_seconds(value):
+    """Inoreader `published` / `updated` — Unix seconds."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return datetime.fromtimestamp(float(text), tz=timezone.utc)
+        return parse_iso_datetime(text)
+    return None
+
+
+def parse_unix_milliseconds(value):
+    """Inoreader `crawlTimeMsec` — Unix milliseconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return datetime.fromtimestamp(float(text) / 1000.0, tz=timezone.utc)
+    return None
+
+
+def parse_unix_microseconds(value):
+    """Inoreader `timestampUsec` — Unix microseconds."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value) / 1_000_000.0, tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return datetime.fromtimestamp(float(text) / 1_000_000.0, tz=timezone.utc)
+    return None
+
+
+def effective_item_date(published_at, source_seen_at):
+    """Lookback helper only — never persisted as published_at."""
+    return published_at or source_seen_at
 
 
 def lookback_cutoff():
@@ -334,29 +380,29 @@ def inoreader_item_to_canonical(item):
     summary_obj = item.get("summary") or item.get("content") or {}
     summary = summary_obj.get("content","") if isinstance(summary_obj,dict) else str(summary_obj)
     authors = [item["author"]] if item.get("author") else []
-    published_at = parse_timestamp(item.get("published"))
-    # crawlTimeMsec / timestampUsec ≈ when Inoreader first saw the item
-    source_seen_at = parse_timestamp(
-        item.get("crawlTimeMsec") or item.get("timestampUsec") or item.get("updated")
-    )
+    published_at = parse_unix_seconds(item.get("published"))
+    source_seen_at = parse_unix_microseconds(item.get("timestampUsec"))
+    if source_seen_at is None:
+        source_seen_at = parse_unix_milliseconds(item.get("crawlTimeMsec"))
     return {
         "source":"inoreader", "source_external_id":item.get("id"), "source_feed":feed,
         "source_type":detect_source_type(url,feed,categories), "canonical_url":normalize_url(url),
         "title":item.get("title") or "(untitled)", "summary":summary,
-        "published_at": published_at or source_seen_at,
+        "published_at": published_at,
         "source_seen_at": source_seen_at,
-        "updated_at":parse_timestamp(item.get("updated")), "authors_raw":authors,
+        "updated_at": parse_unix_seconds(item.get("updated")), "authors_raw":authors,
         "categories_raw":categories, "inoreader_tags":categories, "raw_metadata":item
     }
 
 
 def fetch_inoreader_items():
     cutoff = lookback_cutoff()
-    cutoff_epoch = int(cutoff.timestamp())
+    cutoff_usec = int(cutoff.timestamp() * 1_000_000)
     log.info(
-        "Inoreader lookback_days=%s cutoff_utc=%s",
+        "Inoreader lookback_days=%s cutoff_utc=%s cutoff_usec=%s",
         INOREADER_LOOKBACK_DAYS,
         cutoff.isoformat(),
+        cutoff_usec,
     )
 
     if INOREADER_FIXTURE:
@@ -379,7 +425,7 @@ def fetch_inoreader_items():
         for page in range(1, INOREADER_MAX_PAGES + 1):
             params = {
                 "n": INOREADER_BATCH_SIZE,
-                "ot": cutoff_epoch,
+                "ot": cutoff_usec,
                 "output": "json",
             }
             if continuation:
@@ -407,10 +453,15 @@ def fetch_inoreader_items():
             if not continuation or not page_items:
                 break
             # Soft stop if this page is entirely older than the lookback window.
-            page_pubs = [
-                parse_timestamp(i.get("published") or i.get("crawlTimeMsec"))
-                for i in page_items
-            ]
+            page_pubs = []
+            for i in page_items:
+                pub = parse_unix_seconds(i.get("published"))
+                seen = parse_unix_microseconds(i.get("timestampUsec"))
+                if seen is None:
+                    seen = parse_unix_milliseconds(i.get("crawlTimeMsec"))
+                eff = effective_item_date(pub, seen)
+                if eff is not None:
+                    page_pubs.append(eff)
             page_pubs = [p for p in page_pubs if p is not None]
             if page_pubs and max(page_pubs) < cutoff:
                 log.info("Inoreader page older than lookback cutoff; stopping pagination")
@@ -424,13 +475,16 @@ def fetch_inoreader_items():
         canonical = inoreader_item_to_canonical(item)
         if not canonical:
             continue
-        published = canonical.get("published_at")
-        if published is None:
+        effective = effective_item_date(
+            canonical.get("published_at"),
+            canonical.get("source_seen_at"),
+        )
+        if effective is None:
             skipped_nodate += 1
             # Keep undated items only if we cannot determine age; still store date as NULL.
             items.append(canonical)
             continue
-        if published < cutoff:
+        if effective < cutoff:
             skipped_old += 1
             continue
         items.append(canonical)
@@ -583,12 +637,26 @@ def org_from_email(email,orgs):
     return sorted(matches,key=lambda o:(-o["priority"],o["canonical_name"]))[0] if matches else None
 
 
-def orgs_from_text(text,orgs):
-    low=(text or "").lower(); out=[]
+def _alias_boundary_pattern(alias: str) -> re.Pattern | None:
+    """Token/boundary-safe alias matcher — supports short aliases (MIT, IBM, xAI)."""
+    name = (alias or "").strip()
+    if not name:
+        return None
+    escaped = re.escape(name)
+    escaped = re.sub(r"\s+", r"\\s+", escaped)
+    return re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", re.I)
+
+
+def orgs_from_text(text, orgs):
+    if not text:
+        return []
+    out = []
     for o in orgs:
-        for name in [o["canonical_name"],*(o["aliases"] or [])]:
-            if len(name)>=4 and name.lower() in low:
-                out.append((o,name)); break
+        for name in [o["canonical_name"], *(o["aliases"] or [])]:
+            pat = _alias_boundary_pattern(name)
+            if pat and pat.search(text):
+                out.append((o, name))
+                break
     return out
 
 
@@ -719,11 +787,64 @@ def person_signal_enabled(active_people_count=0):
 
 def intrinsic_scores(ai_relevance, title, abstract, org_prios, person_prios, *, include_person_signal=True):
     text = f"{title} {abstract}".lower()
-    technical = 4.0 + (1.5 if any(k in text for k in ["benchmark", "evaluation", "architecture", "algorithm", "framework", "system"]) else 0) + (1.0 if any(k in text for k in ["experiment", "empirical", "dataset", "ablation"]) else 0)
-    practical = 3.5 + (2.0 if any(k in text for k in ["deployment", "production", "engineering", "workflow", "agent", "inference", "retrieval"]) else 0) + (1.0 if any(k in text for k in ["enterprise", "developer", "product", "application"]) else 0)
-    professional = 4.0 + (1.5 if practical >= 5.5 else 0) + (1.0 if technical >= 5.5 else 0)
-    learner = 4.0 + (1.0 if any(k in text for k in ["tutorial", "survey", "benchmark", "evaluation"]) else 0)
-    explainability = 5.0 + (1.0 if len(abstract or "") < 2500 else 0)
+
+    technical_rules = []
+    technical = 4.0
+    if any(k in text for k in ["benchmark", "evaluation", "architecture", "algorithm", "framework", "system"]):
+        technical += 1.5
+        technical_rules.append("technical_method_signal")
+    if any(k in text for k in ["experiment", "empirical", "dataset", "ablation"]):
+        technical += 1.0
+        technical_rules.append("technical_empirical_signal")
+
+    practical_rules = []
+    practical = 3.5
+    if any(k in text for k in ["deployment", "production", "engineering", "workflow", "agent", "inference", "retrieval"]):
+        practical += 2.0
+        practical_rules.append("deployment_or_production_signal")
+    if any(k in text for k in ["enterprise", "developer", "product", "application"]):
+        practical += 1.0
+        practical_rules.append("enterprise_or_product_signal")
+
+    professional_rules = []
+    professional = 4.0
+    if practical >= 5.5:
+        professional += 1.5
+        professional_rules.append("high_practical_applicability_threshold")
+    if technical >= 5.5:
+        professional += 1.0
+        professional_rules.append("high_technical_significance_threshold")
+
+    learner_rules = []
+    learner = 4.0
+    if any(k in text for k in ["tutorial", "survey", "benchmark", "evaluation"]):
+        learner += 1.0
+        learner_rules.append("tutorial_survey_or_benchmark_signal")
+
+    explainability_rules = []
+    explainability = 5.0
+    if len(abstract or "") < 2500:
+        explainability += 1.0
+        explainability_rules.append("short_abstract_heuristic")
+
+    weights_with_person = {
+        "ai_relevance": 0.30,
+        "technical_significance": 0.15,
+        "practical_applicability": 0.15,
+        "professional_value": 0.10,
+        "student_learning_value": 0.10,
+        "notable_org_signal": 0.10,
+        "notable_person_signal": 0.10,
+    }
+    weights_without_person = {
+        "ai_relevance": 0.30 / 0.90,
+        "technical_significance": 0.15 / 0.90,
+        "practical_applicability": 0.15 / 0.90,
+        "professional_value": 0.10 / 0.90,
+        "student_learning_value": 0.10 / 0.90,
+        "notable_org_signal": 0.10 / 0.90,
+    }
+
     s = {
         "ai_relevance": clamp(ai_relevance),
         "technical_significance": clamp(technical),
@@ -736,35 +857,95 @@ def intrinsic_scores(ai_relevance, title, abstract, org_prios, person_prios, *, 
         "explainability": clamp(explainability),
     }
     if include_person_signal:
+        weights = weights_with_person
         s["intrinsic_candidate_score"] = clamp(
-            0.30 * s["ai_relevance"]
-            + 0.15 * s["technical_significance"]
-            + 0.15 * s["practical_applicability"]
-            + 0.10 * s["professional_value"]
-            + 0.10 * s["student_learning_value"]
-            + 0.10 * s["notable_org_signal"]
-            + 0.10 * s["notable_person_signal"]
+            weights["ai_relevance"] * s["ai_relevance"]
+            + weights["technical_significance"] * s["technical_significance"]
+            + weights["practical_applicability"] * s["practical_applicability"]
+            + weights["professional_value"] * s["professional_value"]
+            + weights["student_learning_value"] * s["student_learning_value"]
+            + weights["notable_org_signal"] * s["notable_org_signal"]
+            + weights["notable_person_signal"] * s["notable_person_signal"]
         )
     else:
-        # Redistribute the unused 10% person weight across remaining dimensions.
+        weights = weights_without_person
         s["intrinsic_candidate_score"] = clamp(
-            (0.30 / 0.90) * s["ai_relevance"]
-            + (0.15 / 0.90) * s["technical_significance"]
-            + (0.15 / 0.90) * s["practical_applicability"]
-            + (0.10 / 0.90) * s["professional_value"]
-            + (0.10 / 0.90) * s["student_learning_value"]
-            + (0.10 / 0.90) * s["notable_org_signal"]
+            weights["ai_relevance"] * s["ai_relevance"]
+            + weights["technical_significance"] * s["technical_significance"]
+            + weights["practical_applicability"] * s["practical_applicability"]
+            + weights["professional_value"] * s["professional_value"]
+            + weights["student_learning_value"] * s["student_learning_value"]
+            + weights["notable_org_signal"] * s["notable_org_signal"]
         )
-    return s
+
+    provenance = {
+        "method": "deterministic_heuristic",
+        "version": "deterministic-v0.2",
+        "dimensions": {
+            "technical_significance": {
+                "score": s["technical_significance"],
+                "base": 4.0,
+                "matched_rules": technical_rules,
+            },
+            "practical_applicability": {
+                "score": s["practical_applicability"],
+                "base": 3.5,
+                "matched_rules": practical_rules,
+            },
+            "professional_value": {
+                "score": s["professional_value"],
+                "base": 4.0,
+                "matched_rules": professional_rules,
+            },
+            "student_learning_value": {
+                "score": s["student_learning_value"],
+                "base": 4.0,
+                "matched_rules": learner_rules,
+            },
+            "explainability": {
+                "score": s["explainability"],
+                "base": 5.0,
+                "matched_rules": explainability_rules,
+            },
+            "novelty": {
+                "score": s["novelty"],
+                "matched_rules": [],
+                "novelty_method": "fixed_proxy",
+            },
+            "notable_org_signal": {
+                "score": s["notable_org_signal"],
+                "matched_rules": ["watchlist_org_priority_max"] if s["notable_org_signal"] > 0 else [],
+            },
+            "notable_person_signal": {
+                "score": s["notable_person_signal"],
+                "matched_rules": ["watchlist_person_priority_max"] if s["notable_person_signal"] > 0 else [],
+            },
+            "ai_relevance": {
+                "score": s["ai_relevance"],
+                "matched_rules": ["deterministic_relevance_stage"],
+            },
+        },
+        "weights": weights,
+        "person_weight_enabled": include_person_signal,
+        "intrinsic_candidate_score": s["intrinsic_candidate_score"],
+        "industry_relevance": {
+            "status": "not_yet_semantically_scored",
+            "note": "Industry relevance is not populated by deterministic-v0.2; planned for LLM scoring stage.",
+        },
+    }
+    return s, provenance
 
 
-def store_scores(conn,content_id,s,reason):
+def store_scores(conn, content_id, s, scoring_reason, relevance_reason=None):
+    reason = dict(scoring_reason)
+    if relevance_reason:
+        reason["relevance_reason"] = relevance_reason
     with conn.cursor() as cur:
         cur.execute("""
         INSERT INTO research_radar.content_scores(content_id,ai_relevance,technical_significance,novelty,notable_person_signal,notable_org_signal,professional_value,student_learning_value,practical_applicability,explainability,intrinsic_candidate_score,score_version,scoring_reason,scored_at)
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'deterministic-v0.2',%s::jsonb,NOW())
         ON CONFLICT(content_id) DO UPDATE SET ai_relevance=EXCLUDED.ai_relevance,technical_significance=EXCLUDED.technical_significance,novelty=EXCLUDED.novelty,notable_person_signal=EXCLUDED.notable_person_signal,notable_org_signal=EXCLUDED.notable_org_signal,professional_value=EXCLUDED.professional_value,student_learning_value=EXCLUDED.student_learning_value,practical_applicability=EXCLUDED.practical_applicability,explainability=EXCLUDED.explainability,intrinsic_candidate_score=EXCLUDED.intrinsic_candidate_score,score_version=EXCLUDED.score_version,scoring_reason=EXCLUDED.scoring_reason,scored_at=NOW()
-        """,(content_id,s["ai_relevance"],s["technical_significance"],s["novelty"],s["notable_person_signal"],s["notable_org_signal"],s["professional_value"],s["student_learning_value"],s["practical_applicability"],s["explainability"],s["intrinsic_candidate_score"],json.dumps({"relevance_reason":reason,"note":"v0.2: person weight auto-disabled when people watchlist empty; OpenAlex deferred"})))
+        """,(content_id,s["ai_relevance"],s["technical_significance"],s["novelty"],s["notable_person_signal"],s["notable_org_signal"],s["professional_value"],s["student_learning_value"],s["practical_applicability"],s["explainability"],s["intrinsic_candidate_score"],json.dumps(reason)))
 
 
 def store_opportunities(conn,content_id,s,primary):
@@ -810,8 +991,8 @@ def process_item(conn,run_id,item,orgs,people):
         bump(conn,run_id,"orgs_resolved",oc); bump(conn,run_id,"people_resolved",pc); set_status(conn,content_id,"ENTITY_RESOLVED")
         op,pp=signal_priorities(conn,content_id)
         include_person = person_signal_enabled(len(people))
-        s=intrinsic_scores(score,enriched.get("paper_title") or item["title"],enriched.get("abstract") or item.get("summary") or "",op,pp,include_person_signal=include_person)
-        store_scores(conn,content_id,s,reason); bump(conn,run_id,"items_scored"); set_status(conn,content_id,"SCORED"); store_opportunities(conn,content_id,s,primary)
+        s, provenance = intrinsic_scores(score,enriched.get("paper_title") or item["title"],enriched.get("abstract") or item.get("summary") or "",op,pp,include_person_signal=include_person)
+        store_scores(conn,content_id,s,provenance,reason); bump(conn,run_id,"items_scored"); set_status(conn,content_id,"SCORED"); store_opportunities(conn,content_id,s,primary)
         if s["intrinsic_candidate_score"]>=MIN_CANDIDATE_SCORE:
             set_status(conn,content_id,"CANDIDATE"); bump(conn,run_id,"candidates_created")
     except Exception as exc:
@@ -863,8 +1044,28 @@ def stage_ingest(conn, run_id, limit=None):
     for i, item in enumerate(items, 1):
         content_id, is_new = upsert_item(conn, item)
         bump(conn, run_id, "items_new" if is_new else "items_duplicate")
-        set_status(conn, content_id, "INGESTED")
-        event(conn, run_id, content_id, "ingest", "upsert", True, {"title": item.get("title"), "is_new": is_new})
+        if is_new:
+            set_status(conn, content_id, "INGESTED")
+            event(conn, run_id, content_id, "ingest", "upsert", True, {"title": item.get("title"), "is_new": True})
+        else:
+            existing = conn.execute(
+                "SELECT status FROM research_radar.content_items WHERE id=%s",
+                (content_id,),
+            ).fetchone()
+            event(
+                conn,
+                run_id,
+                content_id,
+                "ingest",
+                "ingest_duplicate_preserved",
+                True,
+                {
+                    "title": item.get("title"),
+                    "is_new": False,
+                    "existing_status": existing["status"] if existing else None,
+                    "canonical_url": item.get("canonical_url"),
+                },
+            )
         if i % 25 == 0 or i == len(items):
             log.info("Ingest progress %d/%d last_id=%s title=%s", i, len(items), content_id, (item.get("title") or "")[:80])
     return len(items)
@@ -1152,10 +1353,13 @@ def stage_openalex(conn, run_id, limit=None):
         log.warning("OpenAlex enabled but OPENALEX_API_KEY missing — lookups will likely fail")
 
     orgs = [dict(o) for o in load_orgs(conn)]
+    doi_clause = ""
+    if not OPENALEX_TITLE_SEARCH_ENABLED:
+        doi_clause = " AND pm.doi IS NOT NULL AND trim(pm.doi) <> ''"
     rows = [
         dict(r)
         for r in conn.execute(
-            """
+            f"""
             SELECT pm.content_id AS id,
                    ci.title,
                    ci.status AS item_status,
@@ -1167,6 +1371,7 @@ def stage_openalex(conn, run_id, limit=None):
             JOIN research_radar.content_items ci ON ci.id = pm.content_id
             WHERE pm.openalex_status IN ('PENDING', 'RATE_LIMITED', 'ERROR')
               AND ci.status IN ('ENTITY_RESOLVED', 'SCORED', 'CANDIDATE', 'ENRICHED', 'RELEVANT', 'ERROR')
+              {doi_clause}
             ORDER BY
               CASE pm.openalex_status
                 WHEN 'PENDING' THEN 0
@@ -1298,17 +1503,21 @@ def stage_openalex(conn, run_id, limit=None):
                     return ("matched", content_id, gained, title)
 
                 if not doi:
-                    set_openalex_status(
-                        wconn,
-                        content_id,
-                        "PENDING",
-                        error="no_doi_awaiting_title_or_manual",
-                        bump_attempts=True,
-                    )
-                    stats.pending_remaining += 1
-                    event(wconn, run_id, content_id, "openalex", "pending_no_doi", True, {})
+                    if OPENALEX_TITLE_SEARCH_ENABLED:
+                        set_openalex_status(
+                            wconn,
+                            content_id,
+                            "PENDING",
+                            error="no_doi_awaiting_title_or_manual",
+                            bump_attempts=True,
+                        )
+                        stats.pending_remaining += 1
+                        event(wconn, run_id, content_id, "openalex", "pending_no_doi", True, {})
+                        wconn.commit()
+                        return ("pending", content_id, title)
+                    # Title search disabled — should not be selected; leave status unchanged.
                     wconn.commit()
-                    return ("pending", content_id, title)
+                    return ("deferred_no_doi", content_id, title)
 
                 if openalex_doi_tried and not openalex_doi_found:
                     set_openalex_status(
@@ -1496,7 +1705,7 @@ def stage_score(conn, run_id, limit=None):
                     store_relevance(wconn, row["id"], score, primary, [], reason)
                 enriched = _load_enriched_payload(wconn, row)
                 op, pp = signal_priorities(wconn, row["id"])
-                s = intrinsic_scores(
+                s, provenance = intrinsic_scores(
                     ai_rel,
                     enriched.get("paper_title") or row["title"],
                     enriched.get("abstract") or row.get("summary") or "",
@@ -1504,7 +1713,7 @@ def stage_score(conn, run_id, limit=None):
                     pp,
                     include_person_signal=include_person,
                 )
-                store_scores(wconn, row["id"], s, reason)
+                store_scores(wconn, row["id"], s, provenance, reason)
                 bump(wconn, run_id, "items_scored")
                 set_status(wconn, row["id"], "SCORED")
                 store_opportunities(wconn, row["id"], s, primary)
@@ -1615,18 +1824,12 @@ def run_stage(stage, limit=None):
             elif stage == "score":
                 stage_score(conn, run_id, limit=limit)
             elif stage == "all":
-                items = fetch_inoreader_items()
-                if limit is not None:
-                    items = items[:limit]
-                bump(conn, run_id, "items_received", len(items))
-                orgs = load_orgs(conn)
-                people = load_people(conn)
-                log.info("All: processing %d items end-to-end", len(items))
-                for i, item in enumerate(items, 1):
-                    process_item(conn, run_id, item, orgs, people)
-                    if i % 10 == 0 or i == len(items):
-                        log.info("All progress %d/%d", i, len(items))
+                stage_ingest(conn, run_id, limit=limit)
+                stage_relevance(conn, run_id, limit=limit)
+                stage_enrich(conn, run_id, limit=limit)
+                stage_entities(conn, run_id, limit=limit)
                 stage_openalex(conn, run_id, limit=limit)
+                stage_score(conn, run_id, limit=limit)
             else:
                 raise ValueError(f"Unknown stage: {stage}")
             finish_run(conn, run_id, starting_calls, ok=True)

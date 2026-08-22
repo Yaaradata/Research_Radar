@@ -4,15 +4,76 @@ This package implements the MVP architecture from the supplied project brief usi
 
 ## Included
 
-- `sql/001_schema.sql` — creates the `research_radar` schema, canonical corpus, people/org/topic/score/opportunity/provenance tables, pipeline observability, and candidate view.
-- `sql/002_seed_watchlists.sql` — seeds 20 editable organisations plus initial AI topics.
-- `src/research_radar/pipeline.py` — Inoreader ingestion → normalisation → deterministic relevance → arXiv enrichment → evidence-backed org/person resolution → deterministic scoring → candidate corpus.
+- `sql/001_schema.sql` — creates the `research_radar` schema, canonical corpus, people/org/topic/score/opportunity/provenance tables, pipeline observability, candidate view, and analysis view.
+- `sql/002_seed_watchlists.sql` — seeds **30** editable organisations plus initial AI topics.
+- `sql/005_content_analysis_view.sql` — `v_content_analysis` for corpus validation.
+- `src/research_radar/pipeline.py` — staged pipeline: Inoreader ingestion → relevance → arXiv enrichment → local entity resolution → external affiliation (Crossref/OpenAlex) → deterministic scoring.
+- `src/research_radar/affiliation_external.py` — Crossref DOI + OpenAlex DOI singleton (budget-aware).
 - `src/research_radar/query.py` — query candidates by score/org/topic.
 - `scripts/install_ec2.sh` — installs Python/Postgres client and project venv.
 - `scripts/setup_db.sh` — creates tables + watchlists in the **existing RDS**, not a new instance.
-- `scripts/run_pipeline.sh` — one pipeline run.
-- `scripts/install_cron.sh` — optional 15-minute EC2 cron schedule.
+- `scripts/run_stage.sh` — run one pipeline stage with logging.
+- `scripts/run_pipeline.sh` — end-to-end run (`all` stage).
+- `scripts/install_cron.sh` — optional EC2 cron schedule (default every 6 hours).
 - `scripts/golden_test.py` — acceptance checks including `arXiv:2608.02345`.
+
+## Pipeline stages
+
+Run in this order:
+
+```text
+ingest → relevance → enrich → entities → openalex → score → show
+```
+
+| Stage | Purpose |
+|-------|---------|
+| `ingest` | Inoreader → `content_items` (duplicate ingest preserves workflow status) |
+| `relevance` | Deterministic AI relevance filter (`RELEVANT` / `REJECTED`) |
+| `enrich` | arXiv Atom + HTML (metadata, emails, affiliations) |
+| `entities` | Local org/people resolution from paper evidence |
+| `openalex` | Crossref DOI then OpenAlex DOI (title search **disabled by default**) |
+| `score` | Deterministic component scores + `CANDIDATE` label |
+| `show` | Print top N from the **candidate pool** |
+
+`CANDIDATE` is a candidate pool, not automatically the final Top N list. `show --top 20` ranks the top 20 from that pool by intrinsic score.
+
+The `all` stage runs the same stage functions in the same order as the staged pipeline.
+
+## Forward vs historical ingestion
+
+**FORWARD MODE** (current 7-day pipeline)
+
+- Source: Inoreader folder with overlapping recent window
+- Schedule: small number of runs per day (cron default: every 6 hours)
+- Idempotent: duplicate ingest does **not** reset `CANDIDATE` / `SCORED` / etc.
+
+**HISTORICAL BACKFILL MODE** (not implemented in this release)
+
+- Direct arXiv date-range ingestion
+- Extend corpus to Aug 1 first, then earlier months
+- Inoreader lookback is only ~one month — backfill will not rely on it
+
+## Scoring (current — deterministic, not LLM)
+
+Scoring is a **hand-written weighted heuristic**, not an LLM. Component dimensions include technical significance, practical applicability, professional value, student learning value, explainability, and watchlist org/person boosts.
+
+- **Novelty** is a fixed proxy (`novelty_method = fixed_proxy`), not semantic measurement.
+- **Industry relevance** is **not yet semantically scored** — the column exists but deterministic scoring does not populate it.
+- Full provenance is stored in `content_scores.scoring_reason` (`method`, `version`, `matched_rules`, weights).
+
+**Gemini / LLM semantic scoring is the next planned stage** and is not part of this P0 patch.
+
+## OpenAlex external affiliation
+
+OpenAlex is an **affiliation fallback only**, not the scoring engine. Order:
+
+1. Explicit affiliation text / email domain (entities stage)
+2. Crossref DOI lookup (free)
+3. OpenAlex singleton DOI lookup (free; budget-aware 429 handling)
+
+`OPENALEX_TITLE_SEARCH_ENABLED=false` by default. Papers without a DOI stay deferred (`PENDING`) and are excluded from the automatic openalex stage until title search or enrich improves DOI coverage.
+
+OpenAlex/API failure never blocks scoring — organisation is a boost, not a gate.
 
 ## 1. AWS prerequisites
 
@@ -44,7 +105,7 @@ cd /opt/research-radar
 nano .env
 ```
 
-At minimum, put keys in this project's own `.env` (already created under `Research_Radar1/.env`):
+At minimum:
 
 ```env
 DATABASE_URL=postgresql://...
@@ -52,9 +113,14 @@ INOREADER_ACCESS_TOKEN=...
 INOREADER_CLIENT_ID=...
 INOREADER_CLIENT_SECRET=...
 INOREADER_REFRESH_TOKEN=...
+INOREADER_STREAM=user/-/label/10 RESEARCH - T3 Firehose
+INOREADER_LOOKBACK_DAYS=7
+CROSSREF_ENABLED=true
+OPENALEX_ENABLED=true
+OPENALEX_API_KEY=...
+OPENALEX_TITLE_SEARCH_ENABLED=false
+MIN_INTRINSIC_CANDIDATE_SCORE=5.5
 ```
-
-The adapter defaults to Inoreader's Google Reader-compatible reading-list stream. If your existing integration uses another stream, set `INOREADER_STREAM`.
 
 For a smoke test without calling Inoreader:
 
@@ -69,65 +135,44 @@ cd /opt/research-radar
 ./scripts/setup_db.sh
 ```
 
-Tables created:
+Key tables/views:
 
 ```text
 research_radar.content_items
 research_radar.paper_metadata
-research_radar.people
-research_radar.organisations
-research_radar.content_people
-research_radar.content_organisations
-research_radar.topics
-research_radar.content_topics
 research_radar.content_scores
-research_radar.content_opportunities
-research_radar.pipeline_runs
-research_radar.processing_events
 research_radar.v_candidates
+research_radar.v_content_analysis
 ```
 
 ## 5. Run step-by-step (recommended for first runs)
 
-Ingest defaults to the last **7 days** from folder `10 RESEARCH - T3 Firehose` (`INOREADER_LOOKBACK_DAYS=7` in `.env`). Each item stores `published_at` for date-based analysis.
-
-Use separate stages so you can inspect progress and logs after each step:
+Ingest defaults to the last **7 days** (`INOREADER_LOOKBACK_DAYS=7`). Items store `published_at` (publisher date) and `source_seen_at` (Inoreader first-seen) independently.
 
 ```bash
 cd /home/ubuntu/Research_Radar1
-source .venv/bin/activate   # if not already active
+source .venv/bin/activate
 mkdir -p logs
 
-# 0) one-time schema (only once)
-./scripts/setup_db.sh
+./scripts/setup_db.sh   # one-time / after migrations
 
-# 1) Inoreader → content_items
-./scripts/run_stage.sh ingest --limit 50
-
-# 2) AI relevance filter
+./scripts/run_stage.sh ingest
 ./scripts/run_stage.sh relevance
-
-# 3) arXiv enrichment (metadata + emails/affiliations)
-./scripts/run_stage.sh enrich --limit 20
-
-# 4) organisation / people resolution
+./scripts/run_stage.sh enrich
 ./scripts/run_stage.sh entities
-
-# 5) scoring + candidate labels
+./scripts/run_stage.sh openalex
 ./scripts/run_stage.sh score
-
-# 6) print top candidates
-./scripts/run_stage.sh show --top 10
+./scripts/run_stage.sh show --top 20
 ```
 
-Each stage writes terminal output **and** a file under `logs/`.
+Each stage writes terminal output and a file under `logs/`.
 
-Useful SQL checks between stages:
+Useful SQL checks:
 
 ```bash
 source .env
 psql "$DATABASE_URL" -c "SELECT status, COUNT(*) FROM research_radar.content_items GROUP BY status ORDER BY status;"
-psql "$DATABASE_URL" -c "SELECT run_id, started_at, status, notes, items_received, items_relevant, items_enriched, candidates_created, errors FROM research_radar.pipeline_runs ORDER BY started_at DESC LIMIT 10;"
+psql "$DATABASE_URL" -c "SELECT * FROM research_radar.v_content_analysis ORDER BY intrinsic_candidate_score DESC NULLS LAST LIMIT 20;"
 ```
 
 ## 5b. Or run end-to-end in one command
@@ -136,21 +181,6 @@ psql "$DATABASE_URL" -c "SELECT run_id, started_at, status, notes, items_receive
 ./scripts/run_pipeline.sh --top 10
 # same as:
 ./scripts/run_stage.sh all --top 10
-```
-
-Flow:
-
-```text
-Inoreader
-  → canonical ingestion
-  → URL normalisation / arXiv canonical ID
-  → deterministic high-recall AI relevance
-  → arXiv Atom + HTML enrichment
-  → email / affiliation evidence extraction
-  → database watchlist resolution
-  → component scoring
-  → opportunity labels
-  → CANDIDATE corpus
 ```
 
 Per-item failures are logged in `research_radar.processing_events` and do not terminate the batch.
@@ -164,31 +194,15 @@ export PYTHONPATH=/opt/research-radar/src
 .venv/bin/python -m research_radar.query --topic agents
 ```
 
-Or SQL:
-
-```sql
-SELECT *
-FROM research_radar.v_candidates
-ORDER BY intrinsic_candidate_score DESC
-LIMIT 20;
-```
-
 ## 7. Re-run safely
 
-The pipeline canonicalises:
+arXiv versions canonicalise to one identity:
 
 ```text
-2608.02345v1
-2608.02345v2
+2608.02345v1 / 2608.02345v2 → https://arxiv.org/abs/2608.02345
 ```
 
-as one content identity:
-
-```text
-https://arxiv.org/abs/2608.02345
-```
-
-The version is retained separately in `paper_metadata.arxiv_version`, so reruns update rather than duplicate.
+Duplicate ingest in overlapping lookback windows preserves pipeline status (`CANDIDATE` stays `CANDIDATE`).
 
 ## 8. Golden acceptance test
 
@@ -197,31 +211,29 @@ export PYTHONPATH=/opt/research-radar/src
 .venv/bin/python scripts/golden_test.py
 ```
 
-It checks that Amazon is found from **paper evidence** such as an `@amazon.com` author email, and that unknown organisations do not prevent a high-value paper from surviving.
-
 ## 9. Optional cron
 
 ```bash
 ./scripts/install_cron.sh
 ```
 
-Default: every 15 minutes. Override with:
+Default: **every 6 hours** (`0 */6 * * *`). Override with:
 
 ```bash
-SCHEDULE='*/30 * * * *' ./scripts/install_cron.sh
+SCHEDULE='0 */4 * * *' ./scripts/install_cron.sh
 ```
 
 ## Important evidence rule
 
-The current code creates paper-specific relationships only:
+Paper-specific relationships only:
 
 ```text
 relationship_type = paper_author_affiliation
 current_affiliation = false
 ```
 
-If a later resolver finds an author's present employer, store that as a separate relationship with `current_affiliation = true`. Never turn current employment into paper affiliation without paper-specific evidence.
+Current employer must be a separate relationship with `current_affiliation = true` and its own evidence.
 
-## Explicitly deferred for v0.1
+## Explicitly deferred
 
-No UI, agents, sophisticated clustering, embeddings/vector search, LinkedIn scraping, automatic publishing, separate RDS, Kubernetes, Kafka, Airflow, or prompt orchestration.
+No UI, agents, embeddings/vector search, LinkedIn scraping, Kafka, Airflow, historical backfill, or LLM scoring in this release.

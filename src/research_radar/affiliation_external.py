@@ -17,7 +17,7 @@ OPENALEX_REQUEST_SLEEP = float(os.getenv("OPENALEX_REQUEST_SLEEP", "1.2"))
 OPENALEX_MAX_RETRIES = int(os.getenv("OPENALEX_MAX_RETRIES", "5"))
 CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO", "").strip() or os.getenv("OPENALEX_MAILTO", "").strip()
 
-OPENALEX_COST_DOI_USD = 0.0001
+OPENALEX_COST_DOI_USD = 0.0
 OPENALEX_COST_TITLE_SEARCH_USD = 0.001
 
 _OPENALEX_LOCK = threading.Lock()
@@ -76,8 +76,9 @@ class AffiliationStageStats:
 
 
 def reset_openalex_budget_flag():
-    global _OPENALEX_BUDGET_EXHAUSTED
+    global _OPENALEX_BUDGET_EXHAUSTED, _OPENALEX_NEXT_ALLOWED
     _OPENALEX_BUDGET_EXHAUSTED = False
+    _OPENALEX_NEXT_ALLOWED = 0.0
 
 
 def is_openalex_budget_exhausted() -> bool:

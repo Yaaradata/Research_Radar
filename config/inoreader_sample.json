@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "id": "sample-arxiv-2608.02345v1",
+      "title": "Sample arXiv AI agent paper",
+      "author": "Sample Author",
+      "published": 1787100000,
+      "categories": ["cs.AI"],
+      "alternate": [{"href": "https://arxiv.org/abs/2608.02345v1", "type": "text/html"}],
+      "summary": {"content": "AI agents and experimentation."},
+      "origin": {"title": "arXiv AI"}
+    }
+  ]
+}

@@ -145,7 +145,8 @@ def test_gpt_matched_watchlist_name_cannot_create_match():
     assert "matched_watchlist_name" not in ag.RESPONSE_SCHEMA["properties"]["organisations"]["items"]["properties"]
 
 
-def test_ungrounded_gpt_evidence_becomes_review_required():
+def test_ungrounded_organisation_name_becomes_review_required():
+    """Org name not present in affiliation_text → REVIEW_REQUIRED (GPT evidence prose ignored)."""
     watchlist = [_org("MIT", ["MIT", "Massachusetts Institute of Technology"], oid=1)]
     paper = _paper(affiliation_text=["We thank anonymous reviewers."], emails=[])
     parsed = [
@@ -153,13 +154,163 @@ def test_ungrounded_gpt_evidence_becomes_review_required():
             "organisation_name": "Massachusetts Institute of Technology",
             "affiliation_type": "paper_affiliation",
             "confidence": 0.99,
-            "evidence": "Author is known to work at MIT",  # not in supplied evidence
+            "evidence": "Author is known to work at MIT",  # GPT prose — must not self-ground
             "reason": "pretrained guess",
         }
     ]
     decision, mapped = ag.resolve_orgs_from_gpt_result(
         decision="MATCHED",
         parsed_orgs=parsed,
+        paper=paper,
+        watchlist_orgs=watchlist,
+    )
+    assert decision == "REVIEW_REQUIRED"
+    assert mapped == []
+
+
+def test_gpt_evidence_prose_mismatch_still_grounds_org_name():
+    """GPT evidence sentence need not match source; organisation_name containment is enough."""
+    watchlist = []
+    paper = _paper(affiliation_text=["Affiliation: Rutgers University"])
+    parsed = [
+        {
+            "organisation_name": "Rutgers University",
+            "affiliation_type": "paper_affiliation",
+            "confidence": 0.9,
+            "evidence": 'Explicit paper affiliation: “Rutgers University”; emails listed separately',
+            "reason": "named in affiliation",
+        }
+    ]
+    decision, mapped = ag.resolve_orgs_from_gpt_result(
+        decision="MATCHED",
+        parsed_orgs=parsed,
+        paper=paper,
+        watchlist_orgs=watchlist,
+    )
+    assert decision == "NO_MATCH"
+    assert mapped == []
+    assert ag.find_affiliation_blob_for_org("Rutgers University", paper)
+
+
+def test_rutgers_university_explicit_affiliation_grounded():
+    paper = {"affiliation_text": ["Affiliation: Rutgers University"], "emails": [], "local_evidence": []}
+    assert ag.find_affiliation_blob_for_org("Rutgers University", paper)
+
+
+def test_university_of_utah_with_city_state_suffix_grounded():
+    paper = {
+        "affiliation_text": ["Affiliation: University of Utah , Salt Lake City , UT , USA"],
+        "emails": [],
+        "local_evidence": [],
+    }
+    assert ag.find_affiliation_blob_for_org("University of Utah", paper)
+
+
+def test_university_of_luxembourg_embedded_in_institute_address_grounded():
+    paper = {
+        "affiliation_text": [
+            "Interdisciplinary Centre for Security, Reliability and Trust (SnT) "
+            "University of Luxembourg 29 Avenue J.F. Kennedy L-1855, Luxembourg"
+        ],
+        "emails": [],
+        "local_evidence": [],
+    }
+    assert ag.find_affiliation_blob_for_org("University of Luxembourg", paper)
+
+
+def test_shanghai_jiao_tong_inside_school_of_computer_science_grounded():
+    paper = {
+        "affiliation_text": [
+            "Affiliation: School of Computer Science, Shanghai Jiao Tong University, Shanghai, 200240, China"
+        ],
+        "emails": [],
+        "local_evidence": [],
+    }
+    assert ag.find_affiliation_blob_for_org("Shanghai Jiao Tong University", paper)
+    assert ag.find_affiliation_blob_for_org("Zhongguancun Academy", {
+        "affiliation_text": ["Affiliation: Zhongguancun Academy, Beijing, 100097, China"],
+        "emails": [],
+        "local_evidence": [],
+    })
+
+
+def test_grounded_organisation_not_in_watchlist_is_no_match():
+    watchlist = [_org("Meta", ["Meta AI"], oid=1)]
+    paper = _paper(affiliation_text=["Affiliation: Rutgers University"])
+    decision, mapped = ag.resolve_orgs_from_gpt_result(
+        decision="MATCHED",
+        parsed_orgs=[
+            {
+                "organisation_name": "Rutgers University",
+                "affiliation_type": "paper_affiliation",
+                "confidence": 0.95,
+                "evidence": "whatever GPT wrote",
+                "reason": "explicit",
+            }
+        ],
+        paper=paper,
+        watchlist_orgs=watchlist,
+    )
+    assert decision == "NO_MATCH"
+    assert mapped == []
+
+
+def test_grounded_organisation_in_watchlist_is_matched():
+    watchlist = [_org("Rutgers University", ["Rutgers University", "Rutgers"], oid=9)]
+    paper = _paper(affiliation_text=["Affiliation: Rutgers University"])
+    decision, mapped = ag.resolve_orgs_from_gpt_result(
+        decision="MATCHED",
+        parsed_orgs=[
+            {
+                "organisation_name": "Rutgers University",
+                "affiliation_type": "paper_affiliation",
+                "confidence": 0.95,
+                "evidence": "mismatched GPT prose that must be ignored",
+                "reason": "explicit",
+            }
+        ],
+        paper=paper,
+        watchlist_orgs=watchlist,
+    )
+    assert decision == "MATCHED"
+    assert mapped[0]["canonical_name"] == "Rutgers University"
+
+
+def test_no_affiliation_gmail_only_is_review_required():
+    watchlist = [_org("Google", ["Google"], oid=1)]
+    paper = _paper(affiliation_text=[], emails=["alice@gmail.com"])
+    decision, mapped = ag.resolve_orgs_from_gpt_result(
+        decision="MATCHED",
+        parsed_orgs=[
+            {
+                "organisation_name": "Google",
+                "affiliation_type": "email_domain",
+                "confidence": 0.8,
+                "evidence": "alice@gmail.com",
+                "reason": "gmail guess",
+            }
+        ],
+        paper=paper,
+        watchlist_orgs=watchlist,
+    )
+    assert decision == "REVIEW_REQUIRED"
+    assert mapped == []
+
+
+def test_unknown_institutional_email_domain_without_mapping_is_review_required():
+    watchlist = [_org("MIT", ["MIT"], oid=1)]  # no ustc.edu.cn domain
+    paper = _paper(affiliation_text=[], emails=["wyf666@mail.ustc.edu.cn"])
+    decision, mapped = ag.resolve_orgs_from_gpt_result(
+        decision="MATCHED",
+        parsed_orgs=[
+            {
+                "organisation_name": "University of Science and Technology of China",
+                "affiliation_type": "email_domain",
+                "confidence": 0.9,
+                "evidence": "wyf666@mail.ustc.edu.cn",
+                "reason": "inferred from domain",
+            }
+        ],
         paper=paper,
         watchlist_orgs=watchlist,
     )
@@ -214,6 +365,7 @@ def test_non_watchlist_organisation_becomes_no_match():
     )
     assert decision == "NO_MATCH"
     assert mapped == []
+
 
 
 def test_boundary_safe_canonical_organisation_matching():

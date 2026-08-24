@@ -292,11 +292,44 @@ def parse_affiliation_response(payload: dict) -> dict:
 
 
 def _norm_evidence(s: str) -> str:
-    return " ".join((s or "").lower().split())
+    """Normalize for deterministic organisation grounding (not fuzzy / not LLM)."""
+    import re
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", s or "")
+    text = text.lower()
+    # Collapse punctuation to spaces (commas, quotes, parentheses, etc.).
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Strip harmless leading labels without destroying organisation tokens.
+    leading_prefixes = (
+        "affiliation ",
+        "affiliations ",
+        "email ",
+        "emails ",
+        "thanks ",
+        "corresponding author ",
+        "department of ",
+        "school of ",
+        "faculty of ",
+        "college of ",
+        "institute of ",
+        "centre for ",
+        "center for ",
+    )
+    changed = True
+    while changed and text:
+        changed = False
+        for prefix in leading_prefixes:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].strip()
+                changed = True
+                break
+    return text
 
 
-def supplied_evidence_blobs(paper: dict) -> list[str]:
-    """Source evidence only: affiliation_text, emails/domains, local evidence rows."""
+def supplied_affiliation_blobs(paper: dict) -> list[str]:
+    """Original affiliation / local evidence strings used for org-name grounding."""
     blobs: list[str] = []
     affs = paper.get("affiliation_text") or []
     if isinstance(affs, str):
@@ -304,7 +337,18 @@ def supplied_evidence_blobs(paper: dict) -> list[str]:
     for a in affs:
         if a and str(a).strip():
             blobs.append(str(a).strip())
+    for row in paper.get("local_evidence") or []:
+        if not isinstance(row, dict):
+            continue
+        et = (row.get("evidence_text") or "").strip()
+        if et:
+            blobs.append(et)
+    return blobs
 
+
+def supplied_evidence_blobs(paper: dict) -> list[str]:
+    """All source evidence blobs (affiliation + emails) for prompts/debug."""
+    blobs = list(supplied_affiliation_blobs(paper))
     emails = paper.get("emails") or []
     if isinstance(emails, str):
         emails = [emails]
@@ -315,61 +359,114 @@ def supplied_evidence_blobs(paper: dict) -> list[str]:
         blobs.append(e)
         if "@" in e:
             blobs.append(e.rsplit("@", 1)[1].strip().lower())
-
-    for row in paper.get("local_evidence") or []:
-        if not isinstance(row, dict):
-            continue
-        et = (row.get("evidence_text") or "").strip()
-        if et:
-            blobs.append(et)
     return blobs
 
 
-def find_source_evidence_blob(text: str, paper: dict) -> str | None:
-    """Return a supplied evidence blob that grounds `text`, else None."""
-    needle = _norm_evidence(text)
-    if not needle or len(needle) < 2:
+def find_affiliation_blob_for_org(organisation_name: str, paper: dict) -> str | None:
+    """
+    Ground organisation_name against ORIGINAL affiliation_text / local evidence.
+
+    Do NOT require GPT's returned evidence sentence to match source text.
+    """
+    needle = _norm_evidence(organisation_name)
+    if not needle or len(needle) < 3:
         return None
-    for blob in supplied_evidence_blobs(paper):
+    for blob in supplied_affiliation_blobs(paper):
         hay = _norm_evidence(blob)
         if not hay:
             continue
-        if needle in hay or hay in needle:
+        if needle in hay:
             return blob
     return None
 
 
+def find_source_evidence_blob(text: str, paper: dict) -> str | None:
+    """Backward-compatible alias: ground by organisation/name containment in affiliations."""
+    return find_affiliation_blob_for_org(text, paper)
+
+
 def is_grounded_in_supplied_evidence(text: str, paper: dict) -> bool:
-    return find_source_evidence_blob(text, paper) is not None
+    return find_affiliation_blob_for_org(text, paper) is not None
 
 
-def filter_grounded_organisations(parsed_orgs: list[dict], paper: dict) -> list[dict]:
+def _email_domain_deterministically_supports_org(
+    organisation_name: str, paper: dict, watchlist_orgs: list[dict]
+) -> tuple[bool, str | None]:
     """
-    Keep only orgs whose organisation_name and evidence are grounded in supplied
-    paper/email/local evidence. GPT text must never become its own evidence source.
+    Accept email-domain affiliation only when deterministic domain→watchlist mapping
+    supports the extracted organisation. Never invent employers from unknown domains.
+    """
+    from research_radar.pipeline import org_from_email, orgs_from_text
+
+    emails = paper.get("emails") or []
+    if isinstance(emails, str):
+        emails = [emails]
+    needle_hits = orgs_from_text(organisation_name, watchlist_orgs)
+    needle_ids = {o["organisation_id"] for o, _ in needle_hits}
+    for email in emails:
+        email = str(email or "").strip()
+        if not email or "@" not in email:
+            continue
+        mapped = org_from_email(email, watchlist_orgs)
+        if not mapped:
+            continue
+        if mapped["organisation_id"] in needle_ids:
+            return True, email
+        # Also accept if extracted name matches the mapped canonical/alias textually.
+        if find_affiliation_blob_for_org(
+            organisation_name,
+            {"affiliation_text": [mapped["canonical_name"], *(mapped.get("aliases") or [])]},
+        ):
+            return True, email
+    return False, None
+
+
+def filter_grounded_organisations(
+    parsed_orgs: list[dict],
+    paper: dict,
+    watchlist_orgs: list[dict] | None = None,
+) -> list[dict]:
+    """
+    Keep orgs whose organisation_name is grounded in ORIGINAL supplied affiliation
+    evidence (or deterministic email-domain mapping). GPT evidence prose is ignored
+    for grounding.
     """
     grounded = []
     for item in parsed_orgs:
-        src_org = find_source_evidence_blob(item.get("organisation_name") or "", paper)
-        src_ev = find_source_evidence_blob(item.get("evidence") or "", paper)
-        if not src_org or not src_ev:
-            continue
-        grounded.append(
-            {
-                **item,
-                # Persist paper/email/local metadata as the evidence text, not GPT prose.
-                "source_evidence_text": src_ev or src_org,
-                "evidence_source": (
-                    "email_domain"
-                    if item.get("affiliation_type") == "email_domain"
-                    else (
+        org_name = item.get("organisation_name") or ""
+        aff_type = item.get("affiliation_type") or "paper_affiliation"
+
+        src = find_affiliation_blob_for_org(org_name, paper)
+        if src:
+            grounded.append(
+                {
+                    **item,
+                    "source_evidence_text": src,
+                    "evidence_source": (
                         "affiliation_text"
-                        if item.get("affiliation_type") == "paper_affiliation"
-                        else "paper_metadata"
-                    )
-                ),
-            }
-        )
+                        if aff_type in {"paper_affiliation", "inferred_from_supplied_evidence"}
+                        else EVIDENCE_TYPE_MAP.get(aff_type, "affiliation_text")
+                    ),
+                }
+            )
+            continue
+
+        # Email-only invention is forbidden unless deterministic domain mapping agrees.
+        if aff_type == "email_domain" and watchlist_orgs is not None:
+            ok, email = _email_domain_deterministically_supports_org(
+                org_name, paper, watchlist_orgs
+            )
+            if ok:
+                grounded.append(
+                    {
+                        **item,
+                        "source_evidence_text": email,
+                        "evidence_source": "email_domain",
+                    }
+                )
+            # else: drop — REVIEW_REQUIRED if nothing else grounds
+            continue
+        # Ungrounded (including email_domain without mapping, or org not in affiliation_text)
     return grounded
 
 
@@ -393,9 +490,8 @@ def map_orgs_to_watchlist(parsed_orgs: list[dict], watchlist_orgs: list[dict]) -
                     "organisation": org,
                     "canonical_name": org["canonical_name"],
                     "matched_alias": matched_name,
-                    "evidence_type": EVIDENCE_TYPE_MAP.get(
-                        item["affiliation_type"], "paper_metadata"
-                    ),
+                    "evidence_type": item.get("evidence_source")
+                    or EVIDENCE_TYPE_MAP.get(item["affiliation_type"], "paper_metadata"),
                 }
             )
     return mapped
@@ -408,24 +504,17 @@ def finalize_decision(
     *,
     grounded_orgs: list[dict] | None = None,
 ) -> str:
-    """Reconcile GPT decision with grounding + watchlist mapping safety."""
+    """
+    Final decision from grounding + watchlist only:
+      grounded + watchlist → MATCHED
+      grounded + no watchlist → NO_MATCH
+      no grounded → REVIEW_REQUIRED
+    """
     grounded = grounded_orgs if grounded_orgs is not None else parsed_orgs
-    if decision == "MATCHED":
-        # Ungrounded GPT claims must not become MATCHED.
-        if not grounded:
-            return "REVIEW_REQUIRED"
-        if mapped:
-            return "MATCHED"
-        if grounded:
-            return "NO_MATCH"
-        return "REVIEW_REQUIRED"
-    if decision == "NO_MATCH":
-        if mapped:
-            return "MATCHED"
-        return "NO_MATCH"
-    # REVIEW_REQUIRED (or unknown): still accept deterministic grounded watchlist hits.
     if mapped:
         return "MATCHED"
+    if grounded:
+        return "NO_MATCH"
     return "REVIEW_REQUIRED"
 
 
@@ -436,10 +525,8 @@ def resolve_orgs_from_gpt_result(
     paper: dict,
     watchlist_orgs: list[dict],
 ) -> tuple[str, list[dict]]:
-    """Ground → map watchlist → finalize. Returns (decision, mapped_orgs)."""
-    grounded = filter_grounded_organisations(parsed_orgs, paper)
-    if decision == "MATCHED" and parsed_orgs and not grounded:
-        return "REVIEW_REQUIRED", []
+    """Ground organisation_name → map watchlist → finalize."""
+    grounded = filter_grounded_organisations(parsed_orgs, paper, watchlist_orgs)
     mapped = map_orgs_to_watchlist(grounded, watchlist_orgs)
     final = finalize_decision(decision, mapped, parsed_orgs, grounded_orgs=grounded)
     if final != "MATCHED":

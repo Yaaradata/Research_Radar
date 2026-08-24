@@ -23,8 +23,10 @@ from research_radar.pipeline import (
     parse_unix_microseconds,
     parse_unix_milliseconds,
     parse_unix_seconds,
+    reprocess_orgs_local,
     stage_ingest,
     run_stage,
+    timestamps_from_inoreader_raw,
 )
 
 
@@ -267,3 +269,35 @@ def test_industry_relevance_not_falsely_scored():
     _, provenance = intrinsic_scores(6.0, "AI paper", "abstract", [], [], include_person_signal=False)
     assert provenance["industry_relevance"]["status"] == "not_yet_semantically_scored"
     assert "score" not in provenance["industry_relevance"]
+
+
+def test_timestamps_from_raw_metadata():
+    raw = {
+        "published": 1_700_000_000,
+        "timestampUsec": 1_700_000_100_000_000,
+        "updated": 1_700_000_200,
+    }
+    pub, seen, upd = timestamps_from_inoreader_raw(raw)
+    assert pub == parse_unix_seconds(1_700_000_000)
+    assert seen == parse_unix_microseconds(1_700_000_100_000_000)
+    assert upd == parse_unix_seconds(1_700_000_200)
+    assert pub != seen
+
+
+def test_reprocess_orgs_local_preserves_external_evidence():
+    conn = MagicMock()
+    orgs = [_org("Meta", ["Meta AI"])]
+    p = {
+        "emails": [],
+        "affiliation_text": ["Meta AI Research Lab"],
+        "evidence_url": "https://arxiv.org/abs/123",
+    }
+    with patch("research_radar.pipeline.delete_local_org_evidence", return_value=2) as mock_del:
+        with patch("research_radar.pipeline.resolve_orgs_local", return_value=1) as mock_resolve:
+            with patch("research_radar.pipeline.set_openalex_status") as mock_oa:
+                added, deleted = reprocess_orgs_local(conn, 99, p, orgs)
+    assert added == 1
+    assert deleted == 2
+    mock_del.assert_called_once_with(conn, 99)
+    mock_resolve.assert_called_once()
+    mock_oa.assert_called_once_with(conn, 99, "NOT_NEEDED", error=None)

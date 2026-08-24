@@ -9,4 +9,5 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/003_org_watchlist_extend.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/002_seed_watchlists.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/004_openalex_and_source_seen.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/005_content_analysis_view.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/006_content_score_assessments.sql
 echo "research_radar schema + watchlists installed."

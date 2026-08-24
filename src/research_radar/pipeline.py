@@ -359,6 +359,28 @@ def effective_item_date(published_at, source_seen_at):
     return published_at or source_seen_at
 
 
+LOCAL_ORG_EVIDENCE_TYPES = ("email_domain", "explicit_affiliation_text")
+
+
+def timestamps_from_inoreader_raw(raw_metadata):
+    """Re-parse Inoreader timestamps from stored raw_metadata JSON (no API call)."""
+    if not raw_metadata:
+        return None, None, None
+    if isinstance(raw_metadata, str):
+        try:
+            raw_metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError:
+            return None, None, None
+    if not isinstance(raw_metadata, dict):
+        return None, None, None
+    published_at = parse_unix_seconds(raw_metadata.get("published"))
+    source_seen_at = parse_unix_microseconds(raw_metadata.get("timestampUsec"))
+    if source_seen_at is None:
+        source_seen_at = parse_unix_milliseconds(raw_metadata.get("crawlTimeMsec"))
+    updated_at = parse_unix_seconds(raw_metadata.get("updated"))
+    return published_at, source_seen_at, updated_at
+
+
 def lookback_cutoff():
     days = max(1, INOREADER_LOOKBACK_DAYS)
     return datetime.now(timezone.utc) - timedelta(days=days)
@@ -687,6 +709,31 @@ def resolve_orgs_local(conn, content_id, p, orgs):
                 seen.add(key)
                 count += 1
     return count
+
+
+def delete_local_org_evidence(conn, content_id):
+    """Remove only deterministic local affiliation evidence (preserve Crossref/OpenAlex)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM research_radar.content_organisations
+            WHERE content_id = %s
+              AND relationship_type = 'paper_author_affiliation'
+              AND current_affiliation = FALSE
+              AND evidence_type = ANY(%s)
+            """,
+            (content_id, list(LOCAL_ORG_EVIDENCE_TYPES)),
+        )
+        return cur.rowcount
+
+
+def reprocess_orgs_local(conn, content_id, p, orgs):
+    """Re-run local org matching from stored enrichment; preserve external evidence."""
+    deleted = delete_local_org_evidence(conn, content_id)
+    count = resolve_orgs_local(conn, content_id, p, orgs)
+    if count > 0:
+        set_openalex_status(conn, content_id, "NOT_NEEDED", error=None)
+    return count, deleted
 
 
 def count_content_org_matches(conn, content_id):
@@ -1071,6 +1118,66 @@ def stage_ingest(conn, run_id, limit=None):
     return len(items)
 
 
+def stage_repair_timestamps(conn, run_id, limit=None):
+    """One-time repair: re-parse published_at / source_seen_at from stored Inoreader raw_metadata."""
+    rows = conn.execute(
+        """
+        SELECT id, title, raw_metadata, published_at, source_seen_at, updated_at
+        FROM research_radar.content_items
+        WHERE source = 'inoreader'
+          AND raw_metadata IS NOT NULL
+          AND raw_metadata::text <> '{}'
+        ORDER BY id
+        LIMIT %s
+        """,
+        (limit or 10_000,),
+    ).fetchall()
+    log.info("Repair timestamps: scanning %d inoreader rows with raw_metadata", len(rows))
+    updated = unchanged = 0
+    for i, row in enumerate(rows, 1):
+        pub, seen, upd = timestamps_from_inoreader_raw(row["raw_metadata"])
+        new_pub = pub if pub is not None else row["published_at"]
+        new_seen = seen if seen is not None else row["source_seen_at"]
+        new_upd = upd if upd is not None else row.get("updated_at")
+        if (
+            new_pub == row["published_at"]
+            and new_seen == row["source_seen_at"]
+            and new_upd == row.get("updated_at")
+        ):
+            unchanged += 1
+            continue
+        conn.execute(
+            """
+            UPDATE research_radar.content_items
+            SET published_at = %s,
+                source_seen_at = %s,
+                updated_at = %s,
+                modified_at = NOW()
+            WHERE id = %s
+            """,
+            (new_pub, new_seen, new_upd, row["id"]),
+        )
+        event(
+            conn,
+            run_id,
+            row["id"],
+            "repair_timestamps",
+            "updated_from_raw_metadata",
+            True,
+            {
+                "published_at": str(new_pub) if new_pub else None,
+                "source_seen_at": str(new_seen) if new_seen else None,
+                "updated_at": str(new_upd) if new_upd else None,
+            },
+        )
+        updated += 1
+        if i % 100 == 0 or i == len(rows):
+            log.info("Repair timestamps progress %d/%d updated=%d unchanged=%d", i, len(rows), updated, unchanged)
+    log.info("Repair timestamps done updated=%d unchanged=%d", updated, unchanged)
+    bump(conn, run_id, "items_received", updated)
+    return updated
+
+
 def stage_relevance(conn, run_id, limit=None):
     rows = conn.execute(
         """
@@ -1324,6 +1431,89 @@ def stage_entities(conn, run_id, limit=None):
                 log.error("Entities failed id=%s title=%s err=%s", cid, title[:80], err)
             if done % commit_every == 0 or done == len(rows):
                 log.info("Entities progress %d/%d", done, len(rows))
+    return len(rows)
+
+
+def stage_entities_reprocess(conn, run_id, limit=None):
+    """
+    Re-run local org matching from stored paper_metadata only.
+    Deletes/recalculates email_domain + explicit_affiliation_text evidence.
+    Preserves Crossref/OpenAlex evidence and content workflow status.
+    """
+    orgs = [dict(o) for o in load_orgs(conn)]
+    rows = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT ci.id, ci.title, ci.summary, ci.authors_raw, ci.categories_raw,
+                   ci.source_type, ci.status
+            FROM research_radar.content_items ci
+            INNER JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
+            WHERE ci.status IN ('ENRICHED', 'ENTITY_RESOLVED', 'SCORED', 'CANDIDATE', 'RELEVANT', 'ERROR')
+            ORDER BY ci.id
+            LIMIT %s
+            """,
+            (limit or 10_000,),
+        ).fetchall()
+    ]
+    log.info(
+        "Entities-reprocess: %d enriched papers (orgs=%d) — local evidence only, no status change",
+        len(rows),
+        len(orgs),
+    )
+    total_added = total_deleted = errors = 0
+    for i, row in enumerate(rows, 1):
+        try:
+            enriched = _load_enriched_payload(conn, row)
+            added, deleted = reprocess_orgs_local(conn, row["id"], enriched, orgs)
+            total_added += added
+            total_deleted += deleted
+            if added or deleted:
+                bump(conn, run_id, "orgs_resolved", added)
+                event(
+                    conn,
+                    run_id,
+                    row["id"],
+                    "entities_reprocess",
+                    "local_orgs_recalculated",
+                    True,
+                    {
+                        "orgs_added": added,
+                        "local_evidence_deleted": deleted,
+                        "status_preserved": row["status"],
+                    },
+                )
+                log.info(
+                    "Entities-reprocess id=%s +%d -%d status=%s title=%s",
+                    row["id"],
+                    added,
+                    deleted,
+                    row["status"],
+                    (row.get("title") or "")[:80],
+                )
+        except Exception as exc:
+            errors += 1
+            bump(conn, run_id, "errors")
+            event(
+                conn,
+                run_id,
+                row["id"],
+                "entities_reprocess",
+                "processing_error",
+                False,
+                {"title": row.get("title"), "status": row["status"]},
+                str(exc),
+            )
+            log.exception("Entities-reprocess failed id=%s", row["id"])
+        if i % 50 == 0 or i == len(rows):
+            log.info(
+                "Entities-reprocess progress %d/%d added=%d deleted=%d errors=%d",
+                i,
+                len(rows),
+                total_added,
+                total_deleted,
+                errors,
+            )
     return len(rows)
 
 
@@ -1804,7 +1994,15 @@ def print_top_candidates(top=10):
             )
 
 
-def run_stage(stage, limit=None):
+def run_stage(
+    stage,
+    limit=None,
+    *,
+    sample=None,
+    full=False,
+    dry_run=False,
+    force=False,
+):
     global HTTP_CALLS
     starting_calls = HTTP_CALLS
     with connect() as conn:
@@ -1819,10 +2017,29 @@ def run_stage(stage, limit=None):
                 stage_enrich(conn, run_id, limit=limit)
             elif stage == "entities":
                 stage_entities(conn, run_id, limit=limit)
+            elif stage == "entities-reprocess":
+                stage_entities_reprocess(conn, run_id, limit=limit)
+            elif stage == "repair-timestamps":
+                stage_repair_timestamps(conn, run_id, limit=limit)
             elif stage in {"openalex", "openalex-retry"}:
                 stage_openalex(conn, run_id, limit=limit)
             elif stage == "score":
                 stage_score(conn, run_id, limit=limit)
+            elif stage == "semantic-score":
+                from research_radar.semantic_scoring import stage_semantic_score
+
+                stage_semantic_score(
+                    conn,
+                    run_id,
+                    sample=sample if sample is not None else (100 if not full else None),
+                    full=full,
+                    dry_run=dry_run,
+                    force=force,
+                )
+            elif stage == "semantic-compare":
+                from research_radar.semantic_scoring import print_semantic_compare
+
+                print_semantic_compare(conn, limit=limit or 20)
             elif stage == "all":
                 stage_ingest(conn, run_id, limit=limit)
                 stage_relevance(conn, run_id, limit=limit)
@@ -1851,19 +2068,64 @@ def main():
     ap = argparse.ArgumentParser(description="Research Radar pipeline (run all or one stage)")
     ap.add_argument(
         "--stage",
-        choices=["ingest", "relevance", "enrich", "entities", "openalex", "openalex-retry", "score", "show", "all"],
+        choices=[
+            "ingest",
+            "repair-timestamps",
+            "relevance",
+            "enrich",
+            "entities",
+            "entities-reprocess",
+            "openalex",
+            "openalex-retry",
+            "score",
+            "semantic-score",
+            "semantic-compare",
+            "show",
+            "all",
+        ],
         default="all",
         help="Run one stage at a time so you can inspect DB/logs between steps",
     )
     ap.add_argument("--top", type=int, default=10, help="How many candidates to print after score/all/show")
     ap.add_argument("--limit", type=int, default=None, help="Optional max items for this stage (useful for smoke tests)")
+    ap.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        help="semantic-score: reproducible sample size (must be divisible by 4; default 100)",
+    )
+    ap.add_argument(
+        "--full",
+        action="store_true",
+        help="semantic-score: score all SCORED/CANDIDATE papers (explicit; not default)",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="semantic-score: select sample and estimate cost; zero OpenAI calls",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="semantic-score: overwrite existing assessment for same model/prompt version",
+    )
     args = ap.parse_args()
 
     if args.stage == "show":
         print_top_candidates(args.top)
         return
 
-    run_id = run_stage(args.stage, limit=args.limit)
+    if args.stage == "semantic-score" and args.full is False and args.sample is None:
+        args.sample = 100
+
+    run_id = run_stage(
+        args.stage,
+        limit=args.limit,
+        sample=args.sample,
+        full=args.full,
+        dry_run=args.dry_run,
+        force=args.force,
+    )
     print(f"\nSTAGE COMPLETED: {args.stage} run_id={run_id}")
     if args.stage in {"score", "all"}:
         print_top_candidates(args.top)

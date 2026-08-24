@@ -26,6 +26,7 @@ OPENROUTER_API_BASE = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/ap
 OPENROUTER_HTTP_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "https://theneural.ai/").strip()
 OPENROUTER_APP_TITLE = os.getenv("OPENROUTER_APP_TITLE", "TheNeural Research Radar").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-5.6-sol").strip() or "openai/gpt-5.6-sol"
+SEMANTIC_REASONING_EFFORT = os.getenv("SEMANTIC_REASONING_EFFORT", "medium").strip() or "medium"
 SEMANTIC_MAX_RETRIES = int(os.getenv("SEMANTIC_MAX_RETRIES", "5"))
 SEMANTIC_REQUEST_SLEEP = float(os.getenv("SEMANTIC_REQUEST_SLEEP", "0.2"))
 SEMANTIC_PROMPT_VERSION = os.getenv("SEMANTIC_PROMPT_VERSION", "research-semantic-v1").strip()
@@ -35,7 +36,7 @@ ASSESSMENT_TYPE = "llm_semantic"
 SAMPLE_SEED = int(os.getenv("SEMANTIC_SAMPLE_SEED", "20260824"))
 
 # Pricing (USD per 1M tokens). Override via env — provisional placeholders.
-OPENROUTER_INPUT_COST_PER_MILLION = float(os.getenv("OPENROUTER_INPUT_COST_PER_MILLION", "1.25"))
+OPENROUTER_INPUT_COST_PER_MILLION = float(os.getenv("OPENROUTER_INPUT_COST_PER_MILLION", "2.00"))
 OPENROUTER_OUTPUT_COST_PER_MILLION = float(os.getenv("OPENROUTER_OUTPUT_COST_PER_MILLION", "10.00"))
 
 
@@ -193,6 +194,7 @@ class SemanticRunStats:
             "model": resolve_model_name(),
             "provider": LLM_PROVIDER,
             "prompt_version": SEMANTIC_PROMPT_VERSION,
+            "reasoning_effort": SEMANTIC_REASONING_EFFORT,
             "sample_groups": self.sample_groups,
         }
 
@@ -279,22 +281,22 @@ def build_user_prompt(*, title: str, abstract: str, categories) -> str:
 
 
 def assert_prompt_is_paper_only(prompt: str):
-    """Guard: prompt must not contain organisational or deterministic-score leakage."""
-    banned = [
-        "organisation",
-        "organization",
-        "notable_org",
-        "notable_person",
-        "intrinsic_candidate_score",
-        "CANDIDATE",
-        "OpenAlex",
-        "employer",
-        "watchlist",
-    ]
-    low = prompt.lower()
-    for term in banned:
-        if term.lower() in low:
-            raise SemanticParseError(f"prompt contains forbidden term: {term}")
+    """
+    Structural boundary only: user prompt must be the paper-only template.
+
+    Do NOT scan for banned words. Paper titles/abstracts may legitimately contain
+    terms such as candidate, organization, employer, OpenAlex, or watchlist.
+    Non-paper fields (orgs, people, scores, statuses, OpenAlex metadata) must never
+    be passed into build_user_prompt — that is enforced by call signature + tests.
+    """
+    if not isinstance(prompt, str):
+        raise SemanticParseError("prompt must be a string")
+    if not prompt.startswith("TITLE:"):
+        raise SemanticParseError("prompt must start with TITLE section")
+    if "\nARXIV CATEGORIES:\n" not in prompt:
+        raise SemanticParseError("prompt missing ARXIV CATEGORIES section")
+    if "\nABSTRACT:\n" not in prompt:
+        raise SemanticParseError("prompt missing ABSTRACT section")
 
 
 def parse_structured_assessment(payload: dict) -> tuple[dict[str, float], dict, list[str]]:
@@ -455,12 +457,15 @@ def _usage_tokens_chat(response: Any) -> tuple[int, int]:
 
 def _call_openrouter_chat_completion(client, *, model: str, user_prompt: str):
     """OpenRouter chat/completions + json_schema structured output."""
+    # OpenAI SDK does not accept `reasoning=` on chat.completions.create;
+    # OpenRouter expects it in the request body via extra_body.
     return client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
+        extra_body={"reasoning": {"effort": SEMANTIC_REASONING_EFFORT}},
         temperature=0.2,
         response_format={
             "type": "json_schema",
@@ -489,7 +494,6 @@ def call_semantic_assessment(
 
     user_prompt = build_user_prompt(title=title, abstract=abstract, categories=categories)
     assert_prompt_is_paper_only(user_prompt)
-    assert_prompt_is_paper_only(SYSTEM_PROMPT)
 
     model = resolve_model_name()
 
@@ -565,6 +569,7 @@ call_openai_semantic_assessment = call_semantic_assessment
 
 
 def assessment_exists(conn, content_id: int) -> bool:
+    """True only when a COMPLETED assessment already exists (ERROR/RATE_LIMITED are retryable)."""
     model = resolve_model_name()
     row = conn.execute(
         """
@@ -574,6 +579,7 @@ def assessment_exists(conn, content_id: int) -> bool:
           AND provider = %s
           AND model_name = %s
           AND prompt_version = %s
+          AND status = 'COMPLETED'
         LIMIT 1
         """,
         (content_id, LLM_PROVIDER, model, SEMANTIC_PROMPT_VERSION),
@@ -664,8 +670,30 @@ def upsert_assessment(
             created_at = NOW()
         """
     else:
+        # Retryable statuses (ERROR / RATE_LIMITED / …) may be overwritten;
+        # COMPLETED rows are left untouched unless --force.
         sql += """
-        ON CONFLICT (content_id, provider, model_name, prompt_version) DO NOTHING
+        ON CONFLICT (content_id, provider, model_name, prompt_version) DO UPDATE SET
+            sample_group = EXCLUDED.sample_group,
+            ai_relevance = EXCLUDED.ai_relevance,
+            technical_significance = EXCLUDED.technical_significance,
+            practical_applicability = EXCLUDED.practical_applicability,
+            professional_value = EXCLUDED.professional_value,
+            student_learning_value = EXCLUDED.student_learning_value,
+            apparent_novelty = EXCLUDED.apparent_novelty,
+            explainability = EXCLUDED.explainability,
+            industry_relevance = EXCLUDED.industry_relevance,
+            semantic_score = EXCLUDED.semantic_score,
+            reasons = EXCLUDED.reasons,
+            industry_labels = EXCLUDED.industry_labels,
+            input_tokens = EXCLUDED.input_tokens,
+            output_tokens = EXCLUDED.output_tokens,
+            estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+            response_id = EXCLUDED.response_id,
+            status = EXCLUDED.status,
+            error_message = EXCLUDED.error_message,
+            created_at = NOW()
+        WHERE research_radar.content_score_assessments.status <> 'COMPLETED'
         """
     conn.execute(sql, params)
 

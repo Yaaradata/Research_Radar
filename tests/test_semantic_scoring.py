@@ -117,22 +117,142 @@ def test_prompt_excludes_organisation_and_scores():
     assert "TITLE:" in prompt
     assert "ABSTRACT:" in prompt
     assert "ARXIV CATEGORIES:" in prompt
-    assert "organisation" not in prompt.lower()
-    assert "intrinsic" not in prompt.lower()
-    assert "CANDIDATE" not in prompt
-    assert "OpenAlex" not in prompt
     ss.assert_prompt_is_paper_only(prompt)
 
 
-def test_prompt_guard_rejects_forbidden_terms():
-    with pytest.raises(ss.SemanticParseError):
-        ss.assert_prompt_is_paper_only("This paper is from Meta organisation watchlist")
+def test_prompt_allows_legitimate_words_in_paper_text():
+    prompt = ss.build_user_prompt(
+        title="OpenAlex candidate organization employer analysis in AI systems",
+        abstract=(
+            "We introduce a candidate model for organization-level retrieval. "
+            "Baselines mention OpenAlex and employer affiliation graphs."
+        ),
+        categories=["cs.AI"],
+    )
+    ss.assert_prompt_is_paper_only(prompt)
+    for word in ("candidate", "organization", "OpenAlex", "employer"):
+        assert word in prompt
+
+
+def test_semantic_scoring_allows_candidate_organization_openalex_words():
+    """Full call path must not reject paper text containing formerly banned words."""
+    ok_json = (
+        '{"ai_relevance":{"score":8,"reason":"r"},'
+        '"technical_significance":{"score":7,"reason":"r"},'
+        '"practical_applicability":{"score":6,"reason":"r"},'
+        '"professional_value":{"score":6,"reason":"r"},'
+        '"student_learning_value":{"score":5,"reason":"r"},'
+        '"apparent_novelty":{"score":5,"reason":"r"},'
+        '"explainability":{"score":8,"reason":"r"},'
+        '"industry_relevance":{"score":6,"reason":"r"},'
+        '"industry_labels":[]}'
+    )
+    client = MagicMock()
+    client.chat.completions.create.return_value = MagicMock(
+        id="resp_legit_words",
+        choices=[MagicMock(message=MagicMock(content=ok_json))],
+        usage=MagicMock(prompt_tokens=12, completion_tokens=8),
+    )
+    with patch.dict(os.environ, {"SEMANTIC_SCORING_ENABLED": "true"}, clear=False), patch.object(
+        ss, "OPENROUTER_API_KEY", "sk-or-test"
+    ), patch.object(ss, "SEMANTIC_REQUEST_SLEEP", 0):
+        result = ss.call_semantic_assessment(
+            title="Evaluating a candidate model against OpenAlex organization graphs",
+            abstract="Our candidate model compares organization and employer signals from OpenAlex.",
+            categories=["cs.AI", "cs.LG"],
+            client=client,
+        )
+    assert result["status"] == "COMPLETED"
+    kwargs = client.chat.completions.create.call_args.kwargs
+    user_msg = kwargs["messages"][1]["content"]
+    assert "candidate model" in user_msg
+    assert "organization" in user_msg
+    assert "OpenAlex" in user_msg
+    assert "notable_org_signal" not in user_msg
+    assert "intrinsic_candidate_score" not in user_msg
+
+
+def test_api_request_uses_only_title_abstract_categories():
+    builder_kwargs = {}
+    ok_json = (
+        '{"ai_relevance":{"score":8,"reason":"r"},'
+        '"technical_significance":{"score":7,"reason":"r"},'
+        '"practical_applicability":{"score":6,"reason":"r"},'
+        '"professional_value":{"score":6,"reason":"r"},'
+        '"student_learning_value":{"score":5,"reason":"r"},'
+        '"apparent_novelty":{"score":5,"reason":"r"},'
+        '"explainability":{"score":8,"reason":"r"},'
+        '"industry_relevance":{"score":6,"reason":"r"},'
+        '"industry_labels":[]}'
+    )
+
+    real_builder = ss.build_user_prompt
+
+    def _tracking_builder(*, title, abstract, categories):
+        builder_kwargs.update(
+            {
+                "title": title,
+                "abstract": abstract,
+                "categories": categories,
+            }
+        )
+        assert set(builder_kwargs) == {"title", "abstract", "categories"}
+        return real_builder(title=title, abstract=abstract, categories=categories)
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = MagicMock(
+        id="resp_only_fields",
+        choices=[MagicMock(message=MagicMock(content=ok_json))],
+        usage=MagicMock(prompt_tokens=10, completion_tokens=10),
+    )
+    with patch.dict(os.environ, {"SEMANTIC_SCORING_ENABLED": "true"}, clear=False), patch.object(
+        ss, "OPENROUTER_API_KEY", "sk-or-test"
+    ), patch.object(ss, "SEMANTIC_REQUEST_SLEEP", 0), patch.object(
+        ss, "build_user_prompt", side_effect=_tracking_builder
+    ):
+        ss.call_semantic_assessment(
+            title="Paper title",
+            abstract="Paper abstract with candidate model",
+            categories=["cs.AI"],
+            client=client,
+        )
+
+    assert builder_kwargs == {
+        "title": "Paper title",
+        "abstract": "Paper abstract with candidate model",
+        "categories": ["cs.AI"],
+    }
+    api_kwargs = client.chat.completions.create.call_args.kwargs
+    user_content = api_kwargs["messages"][1]["content"]
+    assert user_content.startswith("TITLE:")
+    assert "ARXIV CATEGORIES:" in user_content
+    assert "ABSTRACT:" in user_content
+    assert "Paper title" in user_content
+    assert "Paper abstract with candidate model" in user_content
+    assert "cs.AI" in user_content
+    for forbidden_field in (
+        "notable_org_signal",
+        "notable_person_signal",
+        "intrinsic_candidate_score",
+        "content_status",
+        "openalex_id",
+        "watchlist_id",
+    ):
+        assert forbidden_field not in user_content
 
 
 def test_duplicate_assessment_skipped_without_force():
     conn = MagicMock()
     conn.execute.return_value.fetchone.return_value = {"ok": 1}
     assert ss.assessment_exists(conn, 42) is True
+    sql = conn.execute.call_args[0][0]
+    assert "status = 'COMPLETED'" in sql
+
+
+def test_assessment_exists_false_when_no_completed_row():
+    conn = MagicMock()
+    conn.execute.return_value.fetchone.return_value = None
+    assert ss.assessment_exists(conn, 42) is False
 
 
 def test_force_upsert_uses_on_conflict_update():
@@ -154,7 +274,7 @@ def test_force_upsert_uses_on_conflict_update():
     assert "DO UPDATE SET" in sql
 
 
-def test_non_force_upsert_uses_do_nothing():
+def test_non_force_upsert_overwrites_non_completed_only():
     conn = MagicMock()
     result = {
         "scores": {},
@@ -166,7 +286,9 @@ def test_non_force_upsert_uses_do_nothing():
     }
     ss.upsert_assessment(conn, content_id=1, sample_group="low", result=result, force=False)
     sql = conn.execute.call_args[0][0]
-    assert "DO NOTHING" in sql
+    assert "DO UPDATE SET" in sql
+    assert "status <> 'COMPLETED'" in sql
+    assert "DO NOTHING" not in sql
 
 
 @patch("research_radar.semantic_scoring.time.sleep")
@@ -251,6 +373,33 @@ def test_openrouter_uses_chat_completions(mock_sleep, mock_client_factory):
     client.chat.completions.create.assert_called_once()
 
 
+def test_call_semantic_assessment_reaches_openrouter_for_normal_paper():
+    """SYSTEM_PROMPT is not paper-template-validated; a normal paper must reach the API."""
+    import json
+
+    client = MagicMock()
+    client.chat.completions.create.return_value = MagicMock(
+        id="resp_normal_paper",
+        choices=[MagicMock(message=MagicMock(content=json.dumps(_valid_payload())))],
+        usage=MagicMock(prompt_tokens=50, completion_tokens=40),
+    )
+    with patch.dict(os.environ, {"SEMANTIC_SCORING_ENABLED": "true"}, clear=False), patch.object(
+        ss, "OPENROUTER_API_KEY", "sk-or-test"
+    ), patch.object(ss, "SEMANTIC_REQUEST_SLEEP", 0):
+        out = ss.call_semantic_assessment(
+            title="A Survey of Retrieval-Augmented Generation",
+            abstract="We review retrieval-augmented generation methods for large language models.",
+            categories=["cs.CL", "cs.AI"],
+            client=client,
+        )
+    assert out["status"] == "COMPLETED"
+    client.chat.completions.create.assert_called_once()
+    messages = client.chat.completions.create.call_args.kwargs["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"].startswith("TITLE:")
+
+
 def test_permanent_api_failure_status_error():
     class BadRequest(Exception):
         status_code = 400
@@ -315,12 +464,12 @@ def test_experiment_does_not_modify_status_or_scores_in_stage_path():
 
 
 def test_cost_calculation():
-    with patch.object(ss, "OPENROUTER_INPUT_COST_PER_MILLION", 1.25), patch.object(
+    with patch.object(ss, "OPENROUTER_INPUT_COST_PER_MILLION", 2.0), patch.object(
         ss, "OPENROUTER_OUTPUT_COST_PER_MILLION", 10.0
     ):
-        assert ss.estimate_cost_usd(1_000_000, 1_000_000) == 11.25
+        assert ss.estimate_cost_usd(1_000_000, 1_000_000) == 12.0
         assert ss.estimate_cost_usd(0, 0) == 0.0
-        assert ss.estimate_cost_usd(2000, 1000) == round(2000 / 1e6 * 1.25 + 1000 / 1e6 * 10.0, 6)
+        assert ss.estimate_cost_usd(2000, 1000) == round(2000 / 1e6 * 2.0 + 1000 / 1e6 * 10.0, 6)
 
 
 def test_missing_api_key_fails_safely():
@@ -365,7 +514,6 @@ def test_successful_openrouter_call_parses_and_scores(mock_sleep):
     assert out["input_tokens"] == 100
     call_kwargs = client.chat.completions.create.call_args.kwargs
     user_content = call_kwargs["messages"][1]["content"]
-    assert "intrinsic" not in user_content.lower()
-    assert "organisation" not in user_content.lower()
     assert call_kwargs["model"] == ss.resolve_model_name()
+    assert call_kwargs["extra_body"]["reasoning"]["effort"] == ss.SEMANTIC_REASONING_EFFORT
     assert call_kwargs["response_format"]["type"] == "json_schema"

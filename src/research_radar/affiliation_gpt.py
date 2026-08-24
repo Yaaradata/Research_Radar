@@ -71,7 +71,8 @@ CRITICAL RULES:
 8. Prefer REVIEW_REQUIRED whenever uncertain.
 
 You extract organisation name strings that appear in (or are clearly entailed by) the supplied evidence.
-Do not decide watchlist priority. Do not invent organisations not supported by evidence.
+Do not decide watchlist membership or priority. Do not invent organisations not supported by evidence.
+The "evidence" field must quote or closely paraphrase text from the supplied affiliation strings, emails, or local evidence rows — never invent new evidence.
 """
 
 RESPONSE_SCHEMA: dict[str, Any] = {
@@ -86,7 +87,6 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
                 "properties": {
                     "organisation_name": {"type": "string"},
-                    "matched_watchlist_name": {"type": ["string", "null"]},
                     "affiliation_type": {"type": "string", "enum": list(AFFILIATION_TYPES)},
                     "confidence": {"type": "number"},
                     "evidence": {"type": "string"},
@@ -94,7 +94,6 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                 },
                 "required": [
                     "organisation_name",
-                    "matched_watchlist_name",
                     "affiliation_type",
                     "confidence",
                     "evidence",
@@ -277,13 +276,10 @@ def parse_affiliation_response(payload: dict) -> dict:
         reason = (item.get("reason") or "").strip()
         if not evidence or not reason:
             raise AffiliationGPTError("organisation evidence/reason required", retryable=False)
-        mw = item.get("matched_watchlist_name")
-        if mw is not None:
-            mw = str(mw).strip() or None
+        # Ignore any legacy matched_watchlist_name if a model still emits it.
         orgs.append(
             {
                 "organisation_name": name,
-                "matched_watchlist_name": mw,
                 "affiliation_type": aff_type,
                 "confidence": conf_f,
                 "evidence": evidence,
@@ -295,21 +291,97 @@ def parse_affiliation_response(payload: dict) -> dict:
     return {"decision": decision, "organisations": orgs, "overall_reason": overall}
 
 
+def _norm_evidence(s: str) -> str:
+    return " ".join((s or "").lower().split())
+
+
+def supplied_evidence_blobs(paper: dict) -> list[str]:
+    """Source evidence only: affiliation_text, emails/domains, local evidence rows."""
+    blobs: list[str] = []
+    affs = paper.get("affiliation_text") or []
+    if isinstance(affs, str):
+        affs = [affs]
+    for a in affs:
+        if a and str(a).strip():
+            blobs.append(str(a).strip())
+
+    emails = paper.get("emails") or []
+    if isinstance(emails, str):
+        emails = [emails]
+    for e in emails:
+        e = str(e or "").strip()
+        if not e:
+            continue
+        blobs.append(e)
+        if "@" in e:
+            blobs.append(e.rsplit("@", 1)[1].strip().lower())
+
+    for row in paper.get("local_evidence") or []:
+        if not isinstance(row, dict):
+            continue
+        et = (row.get("evidence_text") or "").strip()
+        if et:
+            blobs.append(et)
+    return blobs
+
+
+def find_source_evidence_blob(text: str, paper: dict) -> str | None:
+    """Return a supplied evidence blob that grounds `text`, else None."""
+    needle = _norm_evidence(text)
+    if not needle or len(needle) < 2:
+        return None
+    for blob in supplied_evidence_blobs(paper):
+        hay = _norm_evidence(blob)
+        if not hay:
+            continue
+        if needle in hay or hay in needle:
+            return blob
+    return None
+
+
+def is_grounded_in_supplied_evidence(text: str, paper: dict) -> bool:
+    return find_source_evidence_blob(text, paper) is not None
+
+
+def filter_grounded_organisations(parsed_orgs: list[dict], paper: dict) -> list[dict]:
+    """
+    Keep only orgs whose organisation_name and evidence are grounded in supplied
+    paper/email/local evidence. GPT text must never become its own evidence source.
+    """
+    grounded = []
+    for item in parsed_orgs:
+        src_org = find_source_evidence_blob(item.get("organisation_name") or "", paper)
+        src_ev = find_source_evidence_blob(item.get("evidence") or "", paper)
+        if not src_org or not src_ev:
+            continue
+        grounded.append(
+            {
+                **item,
+                # Persist paper/email/local metadata as the evidence text, not GPT prose.
+                "source_evidence_text": src_ev or src_org,
+                "evidence_source": (
+                    "email_domain"
+                    if item.get("affiliation_type") == "email_domain"
+                    else (
+                        "affiliation_text"
+                        if item.get("affiliation_type") == "paper_affiliation"
+                        else "paper_metadata"
+                    )
+                ),
+            }
+        )
+    return grounded
+
+
 def map_orgs_to_watchlist(parsed_orgs: list[dict], watchlist_orgs: list[dict]) -> list[dict]:
-    """Deterministic boundary-safe mapping; GPT does not decide priority."""
+    """Deterministic boundary-safe mapping using organisation_name ONLY."""
     from research_radar.pipeline import orgs_from_text
 
     mapped = []
     seen = set()
     for item in parsed_orgs:
-        candidates_text = [
-            item.get("organisation_name") or "",
-            item.get("matched_watchlist_name") or "",
-            item.get("evidence") or "",
-        ]
-        hits = []
-        for text in candidates_text:
-            hits.extend(orgs_from_text(text, watchlist_orgs))
+        name = item.get("organisation_name") or ""
+        hits = orgs_from_text(name, watchlist_orgs)
         for org, matched_name in hits:
             oid = org["organisation_id"]
             if oid in seen:
@@ -329,21 +401,50 @@ def map_orgs_to_watchlist(parsed_orgs: list[dict], watchlist_orgs: list[dict]) -
     return mapped
 
 
-def finalize_decision(decision: str, mapped: list[dict], parsed_orgs: list[dict]) -> str:
-    """Reconcile GPT decision with watchlist mapping safety."""
+def finalize_decision(
+    decision: str,
+    mapped: list[dict],
+    parsed_orgs: list[dict],
+    *,
+    grounded_orgs: list[dict] | None = None,
+) -> str:
+    """Reconcile GPT decision with grounding + watchlist mapping safety."""
+    grounded = grounded_orgs if grounded_orgs is not None else parsed_orgs
     if decision == "MATCHED":
+        # Ungrounded GPT claims must not become MATCHED.
+        if not grounded:
+            return "REVIEW_REQUIRED"
         if mapped:
             return "MATCHED"
-        # GPT claimed match but nothing maps to watchlist.
-        if parsed_orgs:
+        if grounded:
             return "NO_MATCH"
         return "REVIEW_REQUIRED"
     if decision == "NO_MATCH":
-        # If deterministic mapping still finds a watchlist org from GPT strings, accept it.
         if mapped:
             return "MATCHED"
         return "NO_MATCH"
+    # REVIEW_REQUIRED (or unknown): still accept deterministic grounded watchlist hits.
+    if mapped:
+        return "MATCHED"
     return "REVIEW_REQUIRED"
+
+
+def resolve_orgs_from_gpt_result(
+    *,
+    decision: str,
+    parsed_orgs: list[dict],
+    paper: dict,
+    watchlist_orgs: list[dict],
+) -> tuple[str, list[dict]]:
+    """Ground → map watchlist → finalize. Returns (decision, mapped_orgs)."""
+    grounded = filter_grounded_organisations(parsed_orgs, paper)
+    if decision == "MATCHED" and parsed_orgs and not grounded:
+        return "REVIEW_REQUIRED", []
+    mapped = map_orgs_to_watchlist(grounded, watchlist_orgs)
+    final = finalize_decision(decision, mapped, parsed_orgs, grounded_orgs=grounded)
+    if final != "MATCHED":
+        return final, []
+    return final, mapped
 
 
 def _usage_tokens(response: Any) -> tuple[int, int]:
@@ -498,9 +599,14 @@ def upsert_affiliation_assessment(conn, *, content_id: int, result: dict, finger
     orgs = result.get("organisations") or []
     confidences = [float(o.get("confidence") or 0) for o in orgs if isinstance(o, dict)]
     confidence = max(confidences) if confidences else None
-    evidence_bits = [o.get("evidence") for o in orgs if isinstance(o, dict) and o.get("evidence")]
+    evidence_bits = [
+        o.get("evidence") or o.get("source_evidence_text")
+        for o in orgs
+        if isinstance(o, dict) and (o.get("evidence") or o.get("source_evidence_text"))
+    ]
     sources = [
-        EVIDENCE_TYPE_MAP.get(o.get("affiliation_type"), "paper_metadata")
+        o.get("evidence_source")
+        or EVIDENCE_TYPE_MAP.get(o.get("affiliation_type"), "paper_metadata")
         for o in orgs
         if isinstance(o, dict)
     ]
@@ -537,10 +643,13 @@ def write_mapped_orgs(conn, content_id: int, mapped: list[dict], evidence_url: s
     for item in mapped:
         org = item["organisation"]
         etype = item["evidence_type"]
-        etext = item.get("evidence") or item.get("organisation_name")
+        # Source evidence = paper/email/local metadata — never GPT as evidence source.
+        etext = (
+            item.get("source_evidence_text")
+            or item.get("organisation_name")
+        )
         conf = float(item.get("confidence") or 0.7)
         conf = max(0.0, min(1.0, conf))
-        # Prefer not to mark evidence source as GPT — resolver lives in assessment table.
         store_org_evidence(conn, content_id, org, etype, etext, evidence_url, conf)
         written += 1
     return written
@@ -562,6 +671,13 @@ def load_local_evidence_rows(conn, content_id: int) -> list[dict]:
 
 
 def load_affiliation_candidates(conn, limit: int | None = None) -> list[dict]:
+    """
+    Eligible queue:
+      PENDING / ERROR always
+      REVIEW_REQUIRED / NO_MATCH also selected so fingerprint changes can retry;
+      assessment_skip_row skips when evidence+prompt_version unchanged.
+    MATCHED / NOT_NEEDED are terminal for the queue (not selected).
+    """
     rows = conn.execute(
         """
         SELECT
@@ -577,7 +693,7 @@ def load_affiliation_candidates(conn, limit: int | None = None) -> list[dict]:
             pm.affiliation_attempts
         FROM research_radar.paper_metadata pm
         JOIN research_radar.content_items ci ON ci.id = pm.content_id
-        WHERE pm.affiliation_status IN ('PENDING', 'ERROR')
+        WHERE pm.affiliation_status IN ('PENDING', 'ERROR', 'REVIEW_REQUIRED', 'NO_MATCH')
           AND ci.status IN ('ENTITY_RESOLVED', 'SCORED', 'CANDIDATE', 'ENRICHED', 'RELEVANT', 'ERROR')
           AND NOT EXISTS (
               SELECT 1
@@ -588,7 +704,13 @@ def load_affiliation_candidates(conn, limit: int | None = None) -> list[dict]:
                 AND co.evidence_type IN ('email_domain', 'explicit_affiliation_text')
           )
         ORDER BY
-          CASE pm.affiliation_status WHEN 'PENDING' THEN 0 ELSE 1 END,
+          CASE pm.affiliation_status
+            WHEN 'PENDING' THEN 0
+            WHEN 'ERROR' THEN 1
+            WHEN 'REVIEW_REQUIRED' THEN 2
+            WHEN 'NO_MATCH' THEN 3
+            ELSE 4
+          END,
           pm.affiliation_attempts ASC,
           pm.content_id ASC
         LIMIT %s
@@ -743,26 +865,41 @@ def stage_affiliation_gpt(
 
             try:
                 result = call_affiliation_resolver(paper=paper, client=client)
-                mapped = map_orgs_to_watchlist(result["organisations"], watchlist)
-                decision = finalize_decision(
-                    result["decision"], mapped, result["organisations"]
+                decision, mapped = resolve_orgs_from_gpt_result(
+                    decision=result["decision"],
+                    parsed_orgs=result["organisations"],
+                    paper=paper,
+                    watchlist_orgs=watchlist,
                 )
                 result["decision"] = decision
-                # Persist watchlist-canonical org names in stored organisations payload.
+                # Assessment payload: source evidence + deterministic canonical name.
                 store_orgs = []
                 for m in mapped:
                     store_orgs.append(
                         {
                             "organisation_name": m["organisation_name"],
-                            "matched_watchlist_name": m["canonical_name"],
+                            "canonical_watchlist_name": m["canonical_name"],
                             "affiliation_type": m["affiliation_type"],
                             "confidence": m["confidence"],
-                            "evidence": m["evidence"],
+                            "evidence": m.get("source_evidence_text") or m.get("evidence"),
+                            "evidence_source": m.get("evidence_source")
+                            or EVIDENCE_TYPE_MAP.get(m["affiliation_type"], "paper_metadata"),
                             "reason": m["reason"],
+                            "resolver": RESOLVER_NAME,
                         }
                     )
                 if not store_orgs:
-                    store_orgs = result["organisations"]
+                    # Keep grounded-or-raw parse for audit; never treat as GPT evidence rows.
+                    store_orgs = [
+                        {
+                            **o,
+                            "evidence_source": EVIDENCE_TYPE_MAP.get(
+                                o.get("affiliation_type"), "paper_metadata"
+                            ),
+                            "resolver": RESOLVER_NAME,
+                        }
+                        for o in result["organisations"]
+                    ]
                 result["organisations"] = store_orgs
 
                 written = 0

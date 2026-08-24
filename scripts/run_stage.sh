@@ -32,10 +32,15 @@ Stages (run in this order):
   4c) repair-timestamps   Fix published_at/source_seen_at from stored raw_metadata (no Inoreader)
   5) affiliation-gpt   GPT evidence-only affiliation resolver (replaces OpenAlex/Crossref)
   5b) openalex   DEPRECATED legacy Crossref/OpenAlex (inactive unless explicitly enabled)
-  6) score       Component scores + opportunities (SCORED / CANDIDATE)
-  7) semantic-score   GPT assessment-only experiment (does NOT change CANDIDATE baseline)
-  8) semantic-compare Compare deterministic vs GPT semantic ranks
+  6) score       Deterministic component scores + opportunities (SCORED / CANDIDATE)
+                 NOTE: `all` ends here. Semantic scoring is a separate paid stage.
+  7) semantic-score   GPT assessment-only experiment (explicit; NOT part of `all`)
+  8) semantic-compare Compare deterministic vs GPT semantic ranks (explicit)
   9) show        Print top candidates
+
+`all` pipeline order (intentional):
+  ingest → relevance → enrich → entities → affiliation-gpt → score
+  OpenAlex/Crossref are NOT called. semantic-score is NOT auto-run.
 
 Examples:
   ./scripts/run_stage.sh ingest --limit 50

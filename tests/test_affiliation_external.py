@@ -134,6 +134,7 @@ def test_openalex_daily_budget_stops_further_calls(mock_get, _sleep):
     assert mock_get.call_count == 1
 
 
+@patch("research_radar.pipeline.OPENALEX_ENABLED", True)
 @patch("research_radar.pipeline.connect")
 @patch("research_radar.pipeline.load_orgs")
 @patch("research_radar.affiliation_external.resolve_openalex_by_doi")

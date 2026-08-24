@@ -205,6 +205,7 @@ def test_openalex_budget_stops_further_http(mock_get, _sleep):
     assert mock_get.call_count == 1
 
 
+@patch("research_radar.pipeline.OPENALEX_ENABLED", True)
 @patch("research_radar.pipeline.OPENALEX_TITLE_SEARCH_ENABLED", False)
 @patch("research_radar.pipeline.connect")
 @patch("research_radar.pipeline.load_orgs")

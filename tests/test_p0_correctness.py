@@ -233,7 +233,10 @@ def test_all_stage_calls_stages_in_order():
                         with patch("research_radar.pipeline.stage_relevance", side_effect=lambda *a, **k: call_order.append("relevance")):
                             with patch("research_radar.pipeline.stage_enrich", side_effect=lambda *a, **k: call_order.append("enrich")):
                                 with patch("research_radar.pipeline.stage_entities", side_effect=lambda *a, **k: call_order.append("entities")):
-                                    with patch("research_radar.pipeline.stage_openalex", side_effect=lambda *a, **k: call_order.append("openalex")):
+                                    with patch(
+                                        "research_radar.affiliation_gpt.stage_affiliation_gpt",
+                                        side_effect=lambda *a, **k: call_order.append("affiliation-gpt"),
+                                    ):
                                         with patch("research_radar.pipeline.stage_score", side_effect=lambda *a, **k: call_order.append("score")):
                                             run_stage("all")
     assert call_order == [
@@ -241,7 +244,7 @@ def test_all_stage_calls_stages_in_order():
         "relevance",
         "enrich",
         "entities",
-        "openalex",
+        "affiliation-gpt",
         "score",
     ]
 

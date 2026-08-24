@@ -27,10 +27,11 @@ Stages (run in this order):
   1) ingest      Pull Inoreader → content_items (status=INGESTED)
   2) relevance   AI relevance filter (RELEVANT / REJECTED)
   3) enrich      arXiv metadata + emails/affiliations (ENRICHED)
-  4) entities    Local org/people resolution (ENTITY_RESOLVED); OpenAlex deferred
+  4) entities    Local org/people resolution (ENTITY_RESOLVED)
   4b) entities-reprocess  Re-run local org matching from stored enrichment (no API, preserves status)
   4c) repair-timestamps   Fix published_at/source_seen_at from stored raw_metadata (no Inoreader)
-  5) openalex    Crossref DOI + OpenAlex DOI (budget-aware; no auto title search)
+  5) affiliation-gpt   GPT evidence-only affiliation resolver (replaces OpenAlex/Crossref)
+  5b) openalex   DEPRECATED legacy Crossref/OpenAlex (inactive unless explicitly enabled)
   6) score       Component scores + opportunities (SCORED / CANDIDATE)
   7) semantic-score   GPT assessment-only experiment (does NOT change CANDIDATE baseline)
   8) semantic-compare Compare deterministic vs GPT semantic ranks
@@ -43,7 +44,8 @@ Examples:
   ./scripts/run_stage.sh entities
   ./scripts/run_stage.sh entities-reprocess
   ./scripts/run_stage.sh repair-timestamps
-  ./scripts/run_stage.sh openalex --limit 100
+  ./scripts/run_stage.sh affiliation-gpt --dry-run
+  AFFILIATION_GPT_ENABLED=true ./scripts/run_stage.sh affiliation-gpt --limit 50
   ./scripts/run_stage.sh score
   ./scripts/run_stage.sh semantic-score --sample 100 --dry-run
   SEMANTIC_SCORING_ENABLED=true ./scripts/run_stage.sh semantic-score --sample 100

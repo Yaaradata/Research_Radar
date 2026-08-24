@@ -33,16 +33,24 @@ INOREADER_BATCH_SIZE = int(os.getenv("INOREADER_BATCH_SIZE", "100"))
 INOREADER_LOOKBACK_DAYS = int(os.getenv("INOREADER_LOOKBACK_DAYS", "7"))
 INOREADER_MAX_PAGES = int(os.getenv("INOREADER_MAX_PAGES", "50"))
 INOREADER_FIXTURE = os.getenv("INOREADER_FIXTURE", "")
-OPENALEX_ENABLED = os.getenv("OPENALEX_ENABLED", "true").lower() in {"1","true","yes","on"}
+# OpenAlex/Crossref are deprecated for active affiliation enrichment (use affiliation-gpt).
+# Defaults off so the normal pipeline makes no OpenAlex/Crossref HTTP requests.
+OPENALEX_ENABLED = os.getenv("OPENALEX_ENABLED", "false").lower() in {"1","true","yes","on"}
 OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "").strip()
 # Kept for logging only; OpenAlex polite-pool mailto is deprecated in favour of API keys.
 OPENALEX_MAILTO = os.getenv("OPENALEX_MAILTO", "").strip()
 OPENALEX_REQUEST_SLEEP = float(os.getenv("OPENALEX_REQUEST_SLEEP", "1.2"))
 OPENALEX_MAX_RETRIES = int(os.getenv("OPENALEX_MAX_RETRIES", "5"))
 OPENALEX_WORKERS = int(os.getenv("OPENALEX_WORKERS", "1"))
-CROSSREF_ENABLED = os.getenv("CROSSREF_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+CROSSREF_ENABLED = os.getenv("CROSSREF_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO", "").strip() or OPENALEX_MAILTO
 OPENALEX_TITLE_SEARCH_ENABLED = os.getenv("OPENALEX_TITLE_SEARCH_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+AFFILIATION_GPT_ENABLED = os.getenv("AFFILIATION_GPT_ENABLED", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "TheNeural-Research-Radar/0.1")
 ARXIV_REQUEST_SLEEP = float(os.getenv("ARXIV_REQUEST_SLEEP", "1.0"))
@@ -732,7 +740,12 @@ def reprocess_orgs_local(conn, content_id, p, orgs):
     deleted = delete_local_org_evidence(conn, content_id)
     count = resolve_orgs_local(conn, content_id, p, orgs)
     if count > 0:
+        set_affiliation_status(conn, content_id, "NOT_NEEDED", error=None)
         set_openalex_status(conn, content_id, "NOT_NEEDED", error=None)
+    elif count_content_org_matches(conn, content_id) == 0:
+        set_affiliation_status(
+            conn, content_id, "PENDING", error="awaiting_affiliation_gpt"
+        )
     return count, deleted
 
 
@@ -784,19 +797,56 @@ def apply_openalex_orgs(conn, content_id, oa, orgs, evidence_type="paper_specifi
     return apply_external_orgs(conn, content_id, oa, orgs, evidence_type, 0.90)
 
 
+def set_affiliation_status(
+    conn,
+    content_id,
+    status,
+    *,
+    error=None,
+    bump_attempts=False,
+):
+    """Generic affiliation-resolution status (GPT stage queue)."""
+    ensure_paper_metadata_row(conn, content_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE research_radar.paper_metadata
+            SET affiliation_status = %s,
+                affiliation_checked_at = NOW(),
+                affiliation_attempts = CASE WHEN %s THEN affiliation_attempts + 1 ELSE affiliation_attempts END,
+                affiliation_last_error = %s,
+                modified_at = NOW()
+            WHERE content_id = %s
+            """,
+            (status, bump_attempts, error, content_id),
+        )
+
+
 def resolve_orgs(conn, content_id, p, orgs):
     """
-    Deterministic org resolution only. OpenAlex is deferred to stage_openalex
-    so ENTITY_RESOLVED is not lost on 429/budget exhaustion.
+    Deterministic org resolution only. Unresolved papers are queued for
+    affiliation-gpt (not OpenAlex/Crossref).
     """
     count = resolve_orgs_local(conn, content_id, p, orgs)
     ensure_paper_metadata_row(conn, content_id)
     if count > 0:
+        set_affiliation_status(conn, content_id, "NOT_NEEDED", error=None)
+        # Keep historical openalex_* columns consistent for legacy tooling.
         set_openalex_status(conn, content_id, "NOT_NEEDED", error=None)
-    elif CROSSREF_ENABLED or OPENALEX_ENABLED:
-        set_openalex_status(conn, content_id, "PENDING", error="awaiting_external_affiliation_stage")
     else:
-        set_openalex_status(conn, content_id, "NOT_NEEDED", error="external_affiliation_disabled")
+        set_affiliation_status(
+            conn,
+            content_id,
+            "PENDING",
+            error="awaiting_affiliation_gpt",
+        )
+        # Do not queue OpenAlex in the active pipeline.
+        set_openalex_status(
+            conn,
+            content_id,
+            "NOT_NEEDED",
+            error="replaced_by_affiliation_gpt",
+        )
     return count
 
 
@@ -1519,8 +1569,11 @@ def stage_entities_reprocess(conn, run_id, limit=None):
 
 def stage_openalex(conn, run_id, limit=None):
     """
-    External affiliation stage: Crossref DOI (free) then OpenAlex DOI singleton.
-    Does not auto title-search. One shared OpenAlex worker lane.
+    DEPRECATED for active pipeline — use affiliation-gpt instead.
+
+    Legacy Crossref/OpenAlex DOI enrichment. Remains callable only when
+    OPENALEX_ENABLED or CROSSREF_ENABLED is explicitly true. Historical
+    OpenAlex evidence in the DB is preserved.
     """
     from research_radar.affiliation_external import (
         AffiliationStageStats,
@@ -1537,8 +1590,16 @@ def stage_openalex(conn, run_id, limit=None):
     reset_openalex_budget_flag()
 
     if not CROSSREF_ENABLED and not OPENALEX_ENABLED:
-        log.info("External affiliation stage skipped (CROSSREF_ENABLED=false and OPENALEX_ENABLED=false)")
+        log.warning(
+            "stage_openalex is deprecated/inactive "
+            "(OPENALEX_ENABLED=false, CROSSREF_ENABLED=false). "
+            "Use affiliation-gpt instead."
+        )
         return 0
+
+    log.warning(
+        "Running deprecated stage_openalex (legacy). Prefer affiliation-gpt for new runs."
+    )
     if OPENALEX_ENABLED and not OPENALEX_API_KEY:
         log.warning("OpenAlex enabled but OPENALEX_API_KEY missing — lookups will likely fail")
 
@@ -2023,6 +2084,16 @@ def run_stage(
                 stage_repair_timestamps(conn, run_id, limit=limit)
             elif stage in {"openalex", "openalex-retry"}:
                 stage_openalex(conn, run_id, limit=limit)
+            elif stage == "affiliation-gpt":
+                from research_radar.affiliation_gpt import stage_affiliation_gpt
+
+                stage_affiliation_gpt(
+                    conn,
+                    run_id,
+                    limit=limit,
+                    dry_run=dry_run,
+                    force=force,
+                )
             elif stage == "score":
                 stage_score(conn, run_id, limit=limit)
             elif stage == "semantic-score":
@@ -2045,7 +2116,9 @@ def run_stage(
                 stage_relevance(conn, run_id, limit=limit)
                 stage_enrich(conn, run_id, limit=limit)
                 stage_entities(conn, run_id, limit=limit)
-                stage_openalex(conn, run_id, limit=limit)
+                from research_radar.affiliation_gpt import stage_affiliation_gpt
+
+                stage_affiliation_gpt(conn, run_id, limit=limit, dry_run=dry_run, force=force)
                 stage_score(conn, run_id, limit=limit)
             else:
                 raise ValueError(f"Unknown stage: {stage}")
@@ -2077,6 +2150,7 @@ def main():
             "entities-reprocess",
             "openalex",
             "openalex-retry",
+            "affiliation-gpt",
             "score",
             "semantic-score",
             "semantic-compare",
@@ -2102,12 +2176,12 @@ def main():
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="semantic-score: select sample and estimate cost; zero OpenAI calls",
+        help="semantic-score / affiliation-gpt: estimate only; zero OpenRouter calls / writes",
     )
     ap.add_argument(
         "--force",
         action="store_true",
-        help="semantic-score: overwrite existing assessment for same model/prompt version",
+        help="semantic-score / affiliation-gpt: overwrite existing assessment for same model/prompt version",
     )
     args = ap.parse_args()
 

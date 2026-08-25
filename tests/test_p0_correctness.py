@@ -234,18 +234,13 @@ def test_all_stage_calls_stages_in_order():
                         with patch("research_radar.pipeline.stage_relevance", side_effect=lambda *a, **k: call_order.append("relevance")):
                             with patch("research_radar.pipeline.stage_enrich", side_effect=lambda *a, **k: call_order.append("enrich")):
                                 with patch("research_radar.pipeline.stage_entities", side_effect=lambda *a, **k: call_order.append("entities")):
-                                    with patch(
-                                        "research_radar.affiliation_gpt.stage_affiliation_gpt",
-                                        side_effect=lambda *a, **k: call_order.append("affiliation-gpt"),
-                                    ):
-                                        with patch("research_radar.pipeline.stage_score", side_effect=lambda *a, **k: call_order.append("score")):
-                                            run_stage("all")
+                                    with patch("research_radar.pipeline.stage_score", side_effect=lambda *a, **k: call_order.append("score")):
+                                        run_stage("all")
     assert call_order == [
         "ingest",
         "relevance",
         "enrich",
         "entities",
-        "affiliation-gpt",
         "score",
     ]
 
@@ -305,3 +300,37 @@ def test_reprocess_orgs_local_preserves_external_evidence():
     mock_del.assert_called_once_with(conn, 99)
     mock_resolve.assert_called_once()
     mock_oa.assert_called_once_with(conn, 99, "NOT_NEEDED", error=None)
+
+
+def test_paid_stages_require_explicit_authorisation():
+    import pytest as _pytest
+
+    from research_radar.pipeline import PaidStageNotAuthorised, run_stage
+
+    for stage in ("affiliation-gpt", "semantic-score"):
+        with _pytest.raises(PaidStageNotAuthorised):
+            run_stage(stage)
+
+
+def test_dry_run_does_not_require_paid_authorisation():
+    """--dry-run must get past the guard (it fails later on DB, not on the guard)."""
+    from research_radar.pipeline import PaidStageNotAuthorised, run_stage
+
+    try:
+        run_stage("affiliation-gpt", dry_run=True)
+    except PaidStageNotAuthorised:
+        raise AssertionError("dry-run must not be blocked by the paid-stage guard")
+    except Exception:
+        pass  # any other failure (e.g. no DATABASE_URL) is fine here
+
+
+def test_all_stage_does_not_call_paid_affiliation():
+    """`all` is the cron path and must never invoke a paid stage."""
+    import inspect
+
+    from research_radar import pipeline
+
+    src = inspect.getsource(pipeline.run_stage)
+    all_block = src.split('elif stage == "all":')[1].split("else:")[0]
+    assert "stage_affiliation_gpt" not in all_block
+    assert "stage_semantic_score" not in all_block

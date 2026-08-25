@@ -5,6 +5,14 @@ from research_radar.pipeline import bump, connect, load_orgs, load_people, proce
 
 def main():
     with connect() as conn:
+        try:
+            _run_golden(conn)
+        finally:
+            conn.rollback()
+
+
+def _run_golden(conn):
+    if True:  # preserves existing indentation of the block below
         run_id = uuid.uuid4()
         conn.execute("INSERT INTO research_radar.pipeline_runs(run_id) VALUES(%s)", (run_id,))
         orgs, people = load_orgs(conn), load_people(conn)
@@ -43,7 +51,8 @@ def main():
         bump(conn, run_id, "items_received", len(items))
         for item in items:
             process_item(conn, run_id, item, orgs, people)
-        conn.commit()
+        # Deliberately NOT committed — assertions read from the open transaction
+        # and everything is rolled back below so the corpus is never polluted.
         rows = conn.execute(
             "SELECT ci.title,ci.status,cs.notable_org_signal,cs.intrinsic_candidate_score,o.canonical_name,co.evidence_type,co.evidence_text,co.confidence FROM research_radar.content_items ci LEFT JOIN research_radar.content_scores cs ON cs.content_id=ci.id LEFT JOIN research_radar.content_organisations co ON co.content_id=ci.id LEFT JOIN research_radar.organisations o ON o.organisation_id=co.organisation_id WHERE ci.source='golden_test' ORDER BY ci.id DESC"
         ).fetchall()
@@ -59,6 +68,7 @@ def main():
         print(
             "Golden #3 is modelled separately via relationship_type + current_affiliation; current employer is never promoted to paper affiliation."
         )
+        print("Golden test rolled back — no rows written to the corpus.")
 
 
 if __name__ == "__main__":

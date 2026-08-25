@@ -471,7 +471,7 @@ def fetch_inoreader_items():
                 else:
                     raise RuntimeError(
                         "Inoreader access token expired and refresh failed. "
-                        "Re-auth and update INOREADER_ACCESS_TOKEN / INOREADER_REFRESH_TOKEN in Research_Radar1/.env"
+                        "Re-auth and update INOREADER_ACCESS_TOKEN / INOREADER_REFRESH_TOKEN in .env"
                     )
             if not r.ok:
                 raise RuntimeError(f"Inoreader stream fetch failed status={r.status_code} body={r.text[:800]}")
@@ -2055,6 +2055,13 @@ def print_top_candidates(top=10):
             )
 
 
+PAID_STAGES = frozenset({"affiliation-gpt", "semantic-score"})
+
+
+class PaidStageNotAuthorised(RuntimeError):
+    """Raised when a money-spending stage is invoked without explicit authorisation."""
+
+
 def run_stage(
     stage,
     limit=None,
@@ -2063,7 +2070,13 @@ def run_stage(
     full=False,
     dry_run=False,
     force=False,
+    allow_paid=False,
 ):
+    if stage in PAID_STAGES and not dry_run and not allow_paid:
+        raise PaidStageNotAuthorised(
+            f"Stage '{stage}' makes paid OpenRouter calls. "
+            f"Re-run with --allow-paid to authorise spend, or --dry-run to estimate only."
+        )
     global HTTP_CALLS
     starting_calls = HTTP_CALLS
     with connect() as conn:
@@ -2112,13 +2125,12 @@ def run_stage(
 
                 print_semantic_compare(conn, limit=limit or 20)
             elif stage == "all":
+                # `all` is the free/unattended path. Paid stages (affiliation-gpt,
+                # semantic-score) are run explicitly with --allow-paid, never on cron.
                 stage_ingest(conn, run_id, limit=limit)
                 stage_relevance(conn, run_id, limit=limit)
                 stage_enrich(conn, run_id, limit=limit)
                 stage_entities(conn, run_id, limit=limit)
-                from research_radar.affiliation_gpt import stage_affiliation_gpt
-
-                stage_affiliation_gpt(conn, run_id, limit=limit, dry_run=dry_run, force=force)
                 stage_score(conn, run_id, limit=limit)
             else:
                 raise ValueError(f"Unknown stage: {stage}")
@@ -2183,6 +2195,11 @@ def main():
         action="store_true",
         help="semantic-score / affiliation-gpt: overwrite existing assessment for same model/prompt version",
     )
+    ap.add_argument(
+        "--allow-paid",
+        action="store_true",
+        help="Required to run a stage that makes paid OpenRouter calls (affiliation-gpt, semantic-score)",
+    )
     args = ap.parse_args()
 
     if args.stage == "show":
@@ -2199,6 +2216,7 @@ def main():
         full=args.full,
         dry_run=args.dry_run,
         force=args.force,
+        allow_paid=args.allow_paid,
     )
     print(f"\nSTAGE COMPLETED: {args.stage} run_id={run_id}")
     if args.stage in {"score", "all"}:

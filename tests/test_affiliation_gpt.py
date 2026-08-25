@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
 
 import pytest
 
@@ -439,7 +442,7 @@ def test_load_candidates_includes_review_and_no_match_statuses():
 
 
 def test_historical_openalex_status_fix_sql_marks_matched():
-    sql = open("/home/ubuntu/Research_Radar1/sql/008_affiliation_historical_status_fix.sql").read()
+    sql = (SQL_DIR / "008_affiliation_historical_status_fix.sql").read_text()
     assert "paper_specific_openalex" in sql
     assert "historical_external_affiliation_preserved" in sql
     assert "MATCHED" in sql

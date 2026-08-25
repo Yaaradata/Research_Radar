@@ -7,8 +7,10 @@ This package implements the MVP architecture from the supplied project brief usi
 - `sql/001_schema.sql` — creates the `research_radar` schema, canonical corpus, people/org/topic/score/opportunity/provenance tables, pipeline observability, candidate view, and analysis view.
 - `sql/002_seed_watchlists.sql` — seeds **30** editable organisations plus initial AI topics.
 - `sql/005_content_analysis_view.sql` — `v_content_analysis` for corpus validation.
-- `src/research_radar/pipeline.py` — staged pipeline: Inoreader ingestion → relevance → arXiv enrichment → local entity resolution → external affiliation (Crossref/OpenAlex) → deterministic scoring.
-- `src/research_radar/affiliation_external.py` — Crossref DOI + OpenAlex DOI singleton (budget-aware).
+- `src/research_radar/pipeline.py` — staged pipeline: Inoreader ingestion → relevance → arXiv enrichment → local entity resolution → deterministic scoring (`all` path is free/unattended).
+- `src/research_radar/affiliation_gpt.py` — evidence-only GPT affiliation resolver (paid; requires `--allow-paid`).
+- `src/research_radar/semantic_scoring.py` — OpenRouter LLM research-quality assessments (paid; requires `--allow-paid`; assessment-only).
+- `src/research_radar/affiliation_external.py` — legacy Crossref DOI + OpenAlex DOI singleton (inactive by default).
 - `src/research_radar/query.py` — query candidates by score/org/topic.
 - `scripts/install_ec2.sh` — installs Python/Postgres client and project venv.
 - `scripts/setup_db.sh` — creates tables + watchlists in the **existing RDS**, not a new instance.
@@ -22,7 +24,11 @@ This package implements the MVP architecture from the supplied project brief usi
 Run in this order:
 
 ```text
-ingest → relevance → enrich → entities → openalex → score → show
+ingest → relevance → enrich → entities → score → show
+
+Paid stages, run explicitly and never on cron:
+  affiliation-gpt --allow-paid
+  semantic-score  --allow-paid
 ```
 
 | Stage | Purpose |
@@ -31,7 +37,9 @@ ingest → relevance → enrich → entities → openalex → score → show
 | `relevance` | Deterministic AI relevance filter (`RELEVANT` / `REJECTED`) |
 | `enrich` | arXiv Atom + HTML (metadata, emails, affiliations) |
 | `entities` | Local org/people resolution from paper evidence |
-| `openalex` | Crossref DOI then OpenAlex DOI (title search **disabled by default**) |
+| `affiliation-gpt` | Evidence-only GPT affiliation resolver. **Paid** — requires `--allow-paid`. GPT is the resolver, never the evidence source: organisation names must ground back to original paper/email evidence, and watchlist matching is deterministic. |
+| `semantic-score` | LLM research-quality assessment (title/abstract/categories only). **Paid** — requires `--allow-paid`. Assessment-only; does not change `status`. |
+| `openalex` | **DEPRECATED / inactive.** Legacy Crossref + OpenAlex DOI path, retained for historical provenance. Off unless `OPENALEX_ENABLED=true`. |
 | `score` | Deterministic component scores + `CANDIDATE` label |
 | `show` | Print top N from the **candidate pool** |
 
@@ -61,7 +69,11 @@ Scoring is a **hand-written weighted heuristic**, not an LLM. Component dimensio
 - **Industry relevance** is **not yet semantically scored** — the column exists but deterministic scoring does not populate it.
 - Full provenance is stored in `content_scores.scoring_reason` (`method`, `version`, `matched_rules`, weights).
 
-**Gemini / LLM semantic scoring is the next planned stage** and is not part of this P0 patch.
+**LLM semantic scoring is implemented** as a separate assessment layer (`semantic-score`),
+using OpenRouter + `openai/gpt-5.6-sol`, prompt version `research-semantic-v1`. It writes to
+`content_score_assessments` and does **not** currently overwrite `content_items.status` —
+production `CANDIDATE` labels still come from the deterministic score. A final-ranking stage
+that combines semantic quality + verified organisation/person signals is still to be built.
 
 ## OpenAlex external affiliation
 

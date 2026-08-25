@@ -126,10 +126,12 @@ class AffiliationRunStats:
     review_required: int = 0
     failed: int = 0
     skipped_existing: int = 0
+    skipped_no_evidence: int = 0
     orgs_written: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_total_cost_usd: float = 0.0
+    estimated_calls: int = 0
     sample_note: str = ""
 
     def to_dict(self) -> dict:
@@ -138,21 +140,27 @@ class AffiliationRunStats:
             if self.completed
             else 0.0
         )
+        estimated_tokens = int(self.input_tokens or 0) + int(self.output_tokens or 0)
         return {
+            "total_unresolved": self.papers_requested,
             "papers_requested": self.papers_requested,
             "locally_resolved": self.locally_resolved,
             "eligible_for_gpt": self.eligible_for_gpt,
+            "skipped_no_evidence": self.skipped_no_evidence,
             "existing_assessments": self.existing_assessments,
+            "skipped_existing": self.skipped_existing,
             "completed": self.completed,
             "matched": self.matched,
             "no_match": self.no_match,
             "review_required": self.review_required,
             "failed": self.failed,
-            "skipped_existing": self.skipped_existing,
             "orgs_written": self.orgs_written,
+            "estimated_calls": self.estimated_calls,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "estimated_tokens": estimated_tokens,
             "estimated_total_cost_usd": round(self.estimated_total_cost_usd, 6),
+            "estimated_cost": round(self.estimated_total_cost_usd, 6),
             "average_cost_per_paper_usd": avg,
             "model": resolve_affiliation_model(),
             "provider": LLM_PROVIDER,
@@ -328,15 +336,171 @@ def _norm_evidence(s: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Pre-GPT eligibility (avoid OpenRouter when there is nothing to resolve)
+# ---------------------------------------------------------------------------
+
+PERSONAL_EMAIL_DOMAINS = frozenset(
+    {
+        "gmail.com",
+        "googlemail.com",
+        "yahoo.com",
+        "ymail.com",
+        "hotmail.com",
+        "outlook.com",
+        "live.com",
+        "msn.com",
+        "icloud.com",
+        "me.com",
+        "mac.com",
+        "protonmail.com",
+        "proton.me",
+        "aol.com",
+        "mail.com",
+    }
+)
+
+_ORG_LIKE_HINTS = (
+    "university",
+    "université",
+    "universita",
+    "universidad",
+    "college",
+    "institute",
+    "institution",
+    "laboratory",
+    "academy",
+    "school",
+    "centre",
+    "center",
+    "hospital",
+    "polytechnic",
+    "foundation",
+    "research",
+    "corp",
+    "gmbh",
+    "llc",
+)
+
+
+def _iter_strings(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    out = []
+    for item in value:
+        if item is None:
+            continue
+        s = str(item).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def email_domain(email: str) -> str | None:
+    email = (email or "").strip().strip("<>").lower()
+    if "@" not in email:
+        return None
+    return email.rsplit("@", 1)[1].strip().rstrip(".").lower() or None
+
+
+def is_personal_email_domain(domain: str | None) -> bool:
+    if not domain:
+        return True
+    domain = domain.lower().strip(".")
+    if domain in PERSONAL_EMAIL_DOMAINS:
+        return True
+    parts = domain.split(".")
+    if len(parts) >= 2:
+        base = ".".join(parts[-2:])
+        if base in PERSONAL_EMAIL_DOMAINS:
+            return True
+    return False
+
+
+def is_institutional_email(email: str) -> bool:
+    domain = email_domain(email)
+    if not domain:
+        return False
+    return not is_personal_email_domain(domain)
+
+
+def is_meaningful_affiliation_string(text: str) -> bool:
+    """True when a string looks like an organisation affiliation (not email/thanks noise)."""
+    import re
+
+    raw = (text or "").strip()
+    if len(raw) < 5:
+        return False
+    low = raw.lower().strip()
+    if low.startswith("email:") or low.startswith("email "):
+        return False
+    if low.startswith("thanks") and "university" not in low and "institute" not in low:
+        return False
+    if "corresponding author" in low and not any(h in low for h in _ORG_LIKE_HINTS):
+        return False
+    if "@" in raw and not any(h in low for h in _ORG_LIKE_HINTS):
+        return False
+    # Explicit affiliation labels: "Affiliation: MIT" is usable even for short org names.
+    labeled = re.sub(r"^(affiliations?)\s*:?\s*", "", low).strip()
+    if labeled and labeled != low:
+        if (
+            len(labeled) >= 3
+            and any(c.isalpha() for c in labeled)
+            and "@" not in labeled
+            and not labeled.startswith("email")
+        ):
+            return True
+    norm = _norm_evidence(raw)
+    if len(norm) < 5:
+        return False
+    if any(h in norm for h in _ORG_LIKE_HINTS):
+        return True
+    tokens = [t for t in norm.split() if any(c.isalpha() for c in t)]
+    return len(tokens) >= 3 and len(norm) >= 12
+
+
+def has_local_affiliation_evidence(paper: dict) -> bool:
+    return bool(paper.get("local_evidence"))
+
+
+def has_usable_affiliation_evidence(paper: dict) -> bool:
+    """
+    True when GPT has something real to resolve:
+      - meaningful organisation-like affiliation_text, OR
+      - non-personal institutional email domain, OR
+      - local affiliation evidence rows (handled without GPT)
+    """
+    if has_local_affiliation_evidence(paper):
+        return True
+    for aff in _iter_strings(paper.get("affiliation_text")):
+        if is_meaningful_affiliation_string(aff):
+            return True
+    for email in _iter_strings(paper.get("emails")):
+        if is_institutional_email(email):
+            return True
+    return False
+
+
+def is_gpt_eligible_paper(paper: dict) -> bool:
+    """GPT-eligible iff usable non-local evidence exists (local evidence skips GPT)."""
+    if has_local_affiliation_evidence(paper):
+        return False
+    for aff in _iter_strings(paper.get("affiliation_text")):
+        if is_meaningful_affiliation_string(aff):
+            return True
+    for email in _iter_strings(paper.get("emails")):
+        if is_institutional_email(email):
+            return True
+    return False
+
+
 def supplied_affiliation_blobs(paper: dict) -> list[str]:
     """Original affiliation / local evidence strings used for org-name grounding."""
     blobs: list[str] = []
-    affs = paper.get("affiliation_text") or []
-    if isinstance(affs, str):
-        affs = [affs]
-    for a in affs:
-        if a and str(a).strip():
-            blobs.append(str(a).strip())
+    for a in _iter_strings(paper.get("affiliation_text")):
+        blobs.append(a)
     for row in paper.get("local_evidence") or []:
         if not isinstance(row, dict):
             continue
@@ -344,6 +508,7 @@ def supplied_affiliation_blobs(paper: dict) -> list[str]:
         if et:
             blobs.append(et)
     return blobs
+
 
 
 def supplied_evidence_blobs(paper: dict) -> list[str]:
@@ -777,6 +942,7 @@ def load_affiliation_candidates(conn, limit: int | None = None) -> list[dict]:
             pm.doi,
             pm.enrichment_metadata,
             pm.affiliation_status,
+            pm.affiliation_last_error,
             pm.affiliation_attempts
         FROM research_radar.paper_metadata pm
         JOIN research_radar.content_items ci ON ci.id = pm.content_id
@@ -874,7 +1040,7 @@ def stage_affiliation_gpt(
     stats = AffiliationRunStats(
         papers_requested=len(candidates),
         locally_resolved=count_locally_resolved(conn),
-        eligible_for_gpt=len(candidates),
+        eligible_for_gpt=0,
         existing_assessments=count_existing_assessments(conn),
     )
 
@@ -887,12 +1053,12 @@ def stage_affiliation_gpt(
     if not dry_run and not enabled:
         log.warning(
             "AFFILIATION_GPT_ENABLED=false — skipping affiliation-gpt "
-            "(%d eligible papers remain PENDING)",
+            "(%d unresolved papers remain)",
             len(candidates),
         )
         print(
             "\nAFFILIATION GPT SKIPPED (AFFILIATION_GPT_ENABLED=false)\n"
-            f"  eligible_for_gpt: {len(candidates)}\n"
+            f"  total_unresolved: {len(candidates)}\n"
             "  Set AFFILIATION_GPT_ENABLED=true to run."
         )
         return stats
@@ -904,23 +1070,34 @@ def stage_affiliation_gpt(
         est_in = 0
         est_out = 0
         calls = 0
+        eligible = 0
         for paper in candidates:
+            paper = dict(paper)
+            paper.setdefault("local_evidence", paper.get("local_evidence") or [])
+            if has_local_affiliation_evidence(paper):
+                # Would be handled locally without GPT.
+                continue
+            if not is_gpt_eligible_paper(paper):
+                stats.skipped_no_evidence += 1
+                continue
             fp = evidence_fingerprint(paper)
             skip = assessment_skip_row(conn, int(paper["content_id"]), fp, force=force)
             if skip:
                 stats.skipped_existing += 1
                 continue
+            eligible += 1
             calls += 1
             est_in += estimate_prompt_tokens(paper)
             est_out += 250  # structured JSON heuristic
         from research_radar.semantic_scoring import estimate_cost_usd
 
+        stats.eligible_for_gpt = eligible
+        stats.estimated_calls = calls
         stats.input_tokens = est_in
         stats.output_tokens = est_out
         stats.estimated_total_cost_usd = estimate_cost_usd(est_in, est_out)
         stats.sample_note = f"dry_run_estimated_calls={calls}"
         summary = stats.to_dict()
-        summary["estimated_calls"] = calls
         log.info("Affiliation-GPT DRY RUN: %s", json.dumps(summary))
         print("\nAFFILIATION GPT DRY RUN")
         for k, v in summary.items():
@@ -944,6 +1121,37 @@ def stage_affiliation_gpt(
 
             paper = dict(paper)
             paper["local_evidence"] = local_ev
+
+            # No usable affiliation evidence → REVIEW_REQUIRED without OpenRouter.
+            if not is_gpt_eligible_paper(paper):
+                already = (paper.get("affiliation_status") == "REVIEW_REQUIRED") and (
+                    (paper.get("affiliation_last_error") or "") == "no_affiliation_evidence"
+                )
+                if not already:
+                    set_affiliation_status(
+                        wconn,
+                        content_id,
+                        "REVIEW_REQUIRED",
+                        error="no_affiliation_evidence",
+                        bump_attempts=True,
+                    )
+                    event(
+                        wconn,
+                        run_id,
+                        content_id,
+                        "affiliation_gpt",
+                        "no_affiliation_evidence",
+                        True,
+                        {"decision": "REVIEW_REQUIRED"},
+                    )
+                    wconn.commit()
+                else:
+                    wconn.commit()
+                return (
+                    "skipped_no_evidence",
+                    {"content_id": content_id, "decision": "REVIEW_REQUIRED"},
+                )
+
             fp = evidence_fingerprint(paper)
             skip = assessment_skip_row(wconn, content_id, fp, force=force)
             if skip:
@@ -1118,9 +1326,14 @@ def stage_affiliation_gpt(
             done += 1
             if kind == "skipped":
                 stats.skipped_existing += 1
+            elif kind == "skipped_no_evidence":
+                stats.skipped_no_evidence += 1
+                stats.review_required += 1
             elif kind == "local_skip":
                 stats.locally_resolved += 1
             elif kind == "completed":
+                stats.eligible_for_gpt += 1
+                stats.estimated_calls += 1
                 stats.completed += 1
                 decision = payload.get("decision")
                 if decision == "MATCHED":
@@ -1143,6 +1356,7 @@ def stage_affiliation_gpt(
                     payload.get("orgs_written"),
                 )
             else:
+                stats.eligible_for_gpt += 1
                 stats.failed += 1
                 log.warning(
                     "Affiliation GPT FAILED id=%s err=%s",
@@ -1151,12 +1365,13 @@ def stage_affiliation_gpt(
                 )
             if done % 10 == 0 or done == len(candidates):
                 log.info(
-                    "Affiliation GPT progress %d/%d completed=%d failed=%d skipped=%d",
+                    "Affiliation GPT progress %d/%d completed=%d failed=%d skipped=%d no_evidence=%d",
                     done,
                     len(candidates),
                     stats.completed,
                     stats.failed,
                     stats.skipped_existing,
+                    stats.skipped_no_evidence,
                 )
 
     summary = stats.to_dict()

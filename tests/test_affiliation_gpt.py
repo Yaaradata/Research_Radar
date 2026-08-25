@@ -512,6 +512,118 @@ def test_dry_run_makes_zero_api_calls():
     assert mock_call.call_count == 0
     assert mock_client.call_count == 0
     assert stats.eligible_for_gpt == 3
+    assert stats.skipped_no_evidence == 0
+    assert stats.to_dict()["estimated_calls"] == 3
+
+
+def test_empty_affiliations_and_emails_not_gpt_eligible():
+    paper = _paper(affiliation_text=[], emails=[], local_evidence=[])
+    assert not ag.is_gpt_eligible_paper(paper)
+    assert not ag.has_usable_affiliation_evidence(paper)
+
+
+def test_gmail_only_not_gpt_eligible():
+    paper = _paper(affiliation_text=[], emails=["alice@gmail.com"], local_evidence=[])
+    assert not ag.is_gpt_eligible_paper(paper)
+    assert ag.is_institutional_email("alice@gmail.com") is False
+
+
+def test_explicit_affiliation_is_gpt_eligible():
+    paper = _paper(affiliation_text=["Affiliation: Rutgers University"], emails=[])
+    assert ag.is_gpt_eligible_paper(paper)
+
+
+def test_institutional_email_is_gpt_eligible():
+    paper = _paper(affiliation_text=[], emails=["wyf666@mail.ustc.edu.cn"])
+    assert ag.is_institutional_email("wyf666@mail.ustc.edu.cn")
+    assert ag.is_gpt_eligible_paper(paper)
+
+
+def test_local_evidence_skips_gpt_without_openrouter():
+    conn = MagicMock()
+    paper = _paper(affiliation_text=[], emails=[])
+    with patch.object(ag, "load_affiliation_candidates", return_value=[paper]), patch.object(
+        ag, "count_locally_resolved", return_value=1
+    ), patch.object(ag, "count_existing_assessments", return_value=0), patch(
+        "research_radar.pipeline.load_orgs", return_value=[]
+    ), patch("research_radar.pipeline.connect") as mock_connect, patch.object(
+        ag, "call_affiliation_resolver"
+    ) as mock_call, patch.dict(
+        "os.environ", {"AFFILIATION_GPT_ENABLED": "true"}, clear=False
+    ), patch("research_radar.semantic_scoring.create_llm_client"), patch(
+        "research_radar.semantic_scoring.OPENROUTER_API_KEY", "sk-or-test"
+    ):
+        wconn = MagicMock()
+        mock_connect.return_value.__enter__.return_value = wconn
+        wconn.execute.return_value.fetchall.return_value = [
+            {
+                "evidence_type": "explicit_affiliation_text",
+                "evidence_text": "MIT",
+                "confidence": 1.0,
+            }
+        ]
+        stats = ag.stage_affiliation_gpt(conn, "run-local")
+    assert mock_call.call_count == 0
+    assert stats.locally_resolved >= 1
+
+
+def test_dry_run_reports_skipped_no_evidence():
+    conn = MagicMock()
+    papers = [
+        _paper(content_id=1, affiliation_text=["Affiliation: MIT"], emails=[]),
+        _paper(content_id=2, affiliation_text=[], emails=["a@gmail.com"]),
+        _paper(content_id=3, affiliation_text=[], emails=[]),
+    ]
+    with patch.object(ag, "load_affiliation_candidates", return_value=papers), patch.object(
+        ag, "count_locally_resolved", return_value=0
+    ), patch.object(ag, "count_existing_assessments", return_value=0), patch.object(
+        ag, "assessment_skip_row", return_value=None
+    ), patch("research_radar.pipeline.load_orgs", return_value=[]), patch.object(
+        ag, "call_affiliation_resolver"
+    ) as mock_call, patch("research_radar.semantic_scoring.create_llm_client") as mock_client:
+        stats = ag.stage_affiliation_gpt(conn, "run-dry", dry_run=True)
+    assert mock_call.call_count == 0
+    assert mock_client.call_count == 0
+    d = stats.to_dict()
+    assert d["total_unresolved"] == 3
+    assert d["eligible_for_gpt"] == 1
+    assert d["skipped_no_evidence"] == 2
+    assert d["estimated_calls"] == 1
+    assert "estimated_tokens" in d
+    assert "estimated_cost" in d
+
+
+def test_no_evidence_runtime_skips_openrouter_and_sets_review_required():
+    conn = MagicMock()
+    paper = _paper(
+        content_id=99,
+        affiliation_text=[],
+        emails=["x@yahoo.com"],
+        affiliation_status="PENDING",
+        affiliation_last_error=None,
+    )
+    with patch.object(ag, "load_affiliation_candidates", return_value=[paper]), patch.object(
+        ag, "count_locally_resolved", return_value=0
+    ), patch.object(ag, "count_existing_assessments", return_value=0), patch(
+        "research_radar.pipeline.load_orgs", return_value=[]
+    ), patch("research_radar.pipeline.connect") as mock_connect, patch.object(
+        ag, "call_affiliation_resolver"
+    ) as mock_call, patch.dict(
+        "os.environ", {"AFFILIATION_GPT_ENABLED": "true"}, clear=False
+    ), patch("research_radar.semantic_scoring.create_llm_client"), patch(
+        "research_radar.semantic_scoring.OPENROUTER_API_KEY", "sk-or-test"
+    ), patch.object(ag, "set_affiliation_status") as mock_status, patch(
+        "research_radar.pipeline.event"
+    ), patch("research_radar.pipeline.bump"):
+        wconn = MagicMock()
+        mock_connect.return_value.__enter__.return_value = wconn
+        wconn.execute.return_value.fetchall.return_value = []
+        stats = ag.stage_affiliation_gpt(conn, "run-noev")
+    assert mock_call.call_count == 0
+    assert stats.skipped_no_evidence == 1
+    assert mock_status.call_args.kwargs.get("error") == "no_affiliation_evidence" or (
+        mock_status.call_args[0][2] == "REVIEW_REQUIRED"
+    )
 
 
 def test_call_affiliation_resolver_mocked_openrouter():

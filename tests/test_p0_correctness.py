@@ -313,15 +313,20 @@ def test_paid_stages_require_explicit_authorisation():
 
 
 def test_dry_run_does_not_require_paid_authorisation():
-    """--dry-run must get past the guard (it fails later on DB, not on the guard)."""
-    from research_radar.pipeline import PaidStageNotAuthorised, run_stage
+    """--dry-run must pass the guard without ever opening a DB connection."""
+    from unittest.mock import patch
 
-    try:
-        run_stage("affiliation-gpt", dry_run=True)
-    except PaidStageNotAuthorised:
-        raise AssertionError("dry-run must not be blocked by the paid-stage guard")
-    except Exception:
-        pass  # any other failure (e.g. no DATABASE_URL) is fine here
+    import pytest as _pytest
+
+    from research_radar.pipeline import run_stage
+
+    with patch(
+        "research_radar.pipeline.connect",
+        side_effect=RuntimeError("sentinel: guard passed"),
+    ):
+        for stage in ("affiliation-gpt", "semantic-score"):
+            with _pytest.raises(RuntimeError, match="sentinel"):
+                run_stage(stage, dry_run=True)
 
 
 def test_all_stage_does_not_call_paid_affiliation():

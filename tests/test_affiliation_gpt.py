@@ -6,13 +6,13 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
-
 import pytest
 
 from research_radar import affiliation_gpt as ag
 from research_radar import semantic_scoring as ss
 from research_radar.pipeline import orgs_from_text
+
+SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
 
 
 def _org(name, aliases=None, oid=1, priority=5):

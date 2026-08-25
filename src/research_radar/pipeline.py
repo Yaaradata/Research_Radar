@@ -2071,6 +2071,11 @@ def run_stage(
     dry_run=False,
     force=False,
     allow_paid=False,
+    profile=None,
+    since_days=None,
+    diagnose=False,
+    out=None,
+    top=None,
 ):
     if stage in PAID_STAGES and not dry_run and not allow_paid:
         raise PaidStageNotAuthorised(
@@ -2124,6 +2129,40 @@ def run_stage(
                 from research_radar.semantic_scoring import print_semantic_compare
 
                 print_semantic_compare(conn, limit=limit or 20)
+            elif stage == "final-score":
+                from research_radar.final_score import print_distribution, stage_final_score
+
+                if diagnose:
+                    print_distribution(conn, profile=profile)
+                else:
+                    stage_final_score(
+                        conn,
+                        run_id,
+                        profile=profile,
+                        limit=limit,
+                        dry_run=dry_run,
+                    )
+            elif stage == "report":
+                from research_radar.final_score import count_ranked, load_top, render_markdown
+
+                rows = load_top(
+                    conn,
+                    profile=profile,
+                    top=top or 20,
+                    since_days=since_days,
+                )
+                md = render_markdown(
+                    rows,
+                    profile=profile,
+                    since_days=since_days,
+                    corpus_n=count_ranked(conn, profile=profile),
+                )
+                if out:
+                    with open(out, "w", encoding="utf-8") as fh:
+                        fh.write(md)
+                    print(f"Wrote {out} ({len(rows)} papers)")
+                else:
+                    print(md)
             elif stage == "all":
                 # `all` is the free/unattended path. Paid stages (affiliation-gpt,
                 # semantic-score) are run explicitly with --allow-paid, never on cron.
@@ -2166,13 +2205,15 @@ def main():
             "score",
             "semantic-score",
             "semantic-compare",
+            "final-score",
+            "report",
             "show",
             "all",
         ],
         default="all",
         help="Run one stage at a time so you can inspect DB/logs between steps",
     )
-    ap.add_argument("--top", type=int, default=10, help="How many candidates to print after score/all/show")
+    ap.add_argument("--top", type=int, default=10, help="How many candidates to print after score/all/show/report")
     ap.add_argument("--limit", type=int, default=None, help="Optional max items for this stage (useful for smoke tests)")
     ap.add_argument(
         "--sample",
@@ -2188,7 +2229,7 @@ def main():
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="semantic-score / affiliation-gpt: estimate only; zero OpenRouter calls / writes",
+        help="semantic-score / affiliation-gpt / final-score: estimate only; zero OpenRouter calls / writes",
     )
     ap.add_argument(
         "--force",
@@ -2199,6 +2240,27 @@ def main():
         "--allow-paid",
         action="store_true",
         help="Required to run a stage that makes paid OpenRouter calls (affiliation-gpt, semantic-score)",
+    )
+    ap.add_argument(
+        "--profile",
+        default=None,
+        help="final-score / report: weight profile (default radar-v1)",
+    )
+    ap.add_argument(
+        "--since-days",
+        type=int,
+        default=None,
+        help="report: only include papers published in the last N days",
+    )
+    ap.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="final-score: print dimension spread and composite comparison",
+    )
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="report: write markdown to this path instead of stdout",
     )
     args = ap.parse_args()
 
@@ -2217,6 +2279,11 @@ def main():
         dry_run=args.dry_run,
         force=args.force,
         allow_paid=args.allow_paid,
+        profile=args.profile,
+        since_days=args.since_days,
+        diagnose=args.diagnose,
+        out=args.out,
+        top=args.top,
     )
     print(f"\nSTAGE COMPLETED: {args.stage} run_id={run_id}")
     if args.stage in {"score", "all"}:

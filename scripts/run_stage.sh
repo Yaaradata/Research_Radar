@@ -55,12 +55,15 @@ Stages (run in this order):
                  NOTE: `all` ends here. All paid stages are separate and explicit.
   7) semantic-score   GPT assessment-only experiment (PAID — needs --allow-paid)
   8) semantic-compare Compare deterministic vs GPT semantic ranks (explicit)
-  9) show        Print top candidates
+  9) final-score      Recompute ranking from stored assessments + org/person boosts (FREE)
+ 10) report           Markdown Top N from content_final_scores (FREE)
+ 11) show             Print top candidates (deterministic CANDIDATE pool)
 
 `all` pipeline order (intentional, free/unattended — safe for cron):
   ingest → relevance → enrich → entities → score
   No paid stage is ever run by `all`. OpenAlex/Crossref are NOT called.
   affiliation-gpt and semantic-score are explicit and require --allow-paid.
+  final-score / report are free but explicit (not yet in `all`).
 
 Examples:
   ./scripts/run_stage.sh ingest --limit 50
@@ -75,6 +78,10 @@ Examples:
   ./scripts/run_stage.sh semantic-score --sample 100 --dry-run
   SEMANTIC_SCORING_ENABLED=true ./scripts/run_stage.sh semantic-score --sample 100 --allow-paid
   ./scripts/run_stage.sh semantic-compare
+  ./scripts/run_stage.sh final-score --diagnose
+  ./scripts/run_stage.sh final-score --profile radar-v1
+  ./scripts/run_stage.sh report --top 20 --out reports/research-radar-top20.md
+  ./scripts/run_stage.sh report --top 20 --since-days 30 --out reports/top20-30d.md
   ./scripts/run_stage.sh show --top 10
 
 Logs are written to logs/ and also printed to the terminal.

@@ -236,12 +236,14 @@ def test_all_stage_calls_stages_in_order():
                                 with patch("research_radar.pipeline.stage_entities", side_effect=lambda *a, **k: call_order.append("entities")):
                                     with patch("research_radar.pipeline.stage_score", side_effect=lambda *a, **k: call_order.append("score")):
                                         run_stage("all")
+    # Scoring v2 §7: deterministic `score` is removed from the free `all` flow.
+    # It stays available via --stage score, but `all` stops after entities —
+    # independence/semantic-score are paid and require --allow-paid explicitly.
     assert call_order == [
         "ingest",
         "relevance",
         "enrich",
         "entities",
-        "score",
     ]
 
 

@@ -7,9 +7,10 @@ This package implements the MVP architecture from the supplied project brief usi
 - `sql/001_schema.sql` — creates the `research_radar` schema, canonical corpus, people/org/topic/score/opportunity/provenance tables, pipeline observability, candidate view, and analysis view.
 - `sql/002_seed_watchlists.sql` — seeds **30** editable organisations plus initial AI topics.
 - `sql/005_content_analysis_view.sql` — `v_content_analysis` for corpus validation.
-- `src/research_radar/pipeline.py` — staged pipeline: Inoreader ingestion → relevance → arXiv enrichment → local entity resolution → deterministic scoring (`all` path is free/unattended).
+- `src/research_radar/pipeline.py` — staged pipeline: Inoreader ingestion → relevance → arXiv enrichment → local entity resolution (`all` path is free/unattended and stops there; independence + semantic-score + final-score are paid/manual, see below).
 - `src/research_radar/affiliation_gpt.py` — evidence-only GPT affiliation resolver (paid; requires `--allow-paid`).
-- `src/research_radar/semantic_scoring.py` — OpenRouter LLM research-quality assessments (paid; requires `--allow-paid`; assessment-only).
+- `src/research_radar/independence.py` — scoring v2 Call B: categorical independence classifier (`independent` / `self_evaluation` / `unclear` / `not_applicable`), title+abstract+affiliation_text only (paid; requires `--allow-paid`).
+- `src/research_radar/semantic_scoring.py` — scoring v2 Call A: OpenRouter LLM research-quality assessments, title+abstract+categories ONLY, never affiliation (paid; requires `--allow-paid`; assessment-only). v1 (`research-semantic-v1`) code and data are kept, unwired, for comparison.
 - `src/research_radar/affiliation_external.py` — legacy Crossref DOI + OpenAlex DOI singleton (inactive by default).
 - `src/research_radar/query.py` — query candidates by score/org/topic.
 - `scripts/install_ec2.sh` — installs Python/Postgres client and project venv.
@@ -24,11 +25,14 @@ This package implements the MVP architecture from the supplied project brief usi
 Run in this order:
 
 ```text
-ingest → relevance → enrich → entities → score → show
+ingest → relevance → enrich → entities → screen → semantic-score → independence → final-score
 
+`all` (free, cron path) runs only: ingest → relevance → enrich → entities
 Paid stages, run explicitly and never on cron:
   affiliation-gpt --allow-paid
-  semantic-score  --allow-paid
+  screen          --allow-paid   (pass 1 — cheap, non-reasoning, gates who reaches pass 2)
+  semantic-score  --allow-paid   (pass 2 — full rubric, gated subset only)
+  independence    --allow-paid   (pass-2 papers only)
 ```
 
 | Stage | Purpose |
@@ -38,14 +42,24 @@ Paid stages, run explicitly and never on cron:
 | `enrich` | arXiv Atom + HTML (metadata, emails, affiliations) |
 | `entities` | Local org/people resolution from paper evidence |
 | `affiliation-gpt` | Evidence-only GPT affiliation resolver. **Paid** — requires `--allow-paid`. GPT is the resolver, never the evidence source: organisation names must ground back to original paper/email evidence, and watchlist matching is deterministic. |
-| `semantic-score` | LLM research-quality assessment (title/abstract/categories only). **Paid** — requires `--allow-paid`. Assessment-only; does not change `status`. |
+| `screen` | Scoring v2 pass 1 — cheap, non-reasoning `SCREEN_MODEL`, batched 15, 4 dimensions, no prose. Every eligible paper is screened. **Paid** — requires `--allow-paid`. |
+| `semantic-score` | Scoring v2 pass 2 — full rubric, batched 5 randomly, title/abstract/categories **only** (never affiliation), on ONLY the top `GATE_PERCENTILE`% of screen scores (`ai_relevance <= 3` excluded outright). **Paid** — requires `--allow-paid`. Assessment-only; does not change `status`. |
+| `independence` | Scoring v2 Call B — categorical independence classification, batched 20, title+abstract+affiliation_text, runs ONLY on pass-2 (`scoring_tier='full'`) papers. **Paid** — requires `--allow-paid`. |
+| `scoring-cost` | Free, zero API calls — prints the Pass 1 / Pass 2 / Independence / TOTAL cost projection for a full run over the currently eligible pool. Run this before `--allow-paid`. |
 | `openalex` | **DEPRECATED / inactive.** Legacy Crossref + OpenAlex DOI path, retained for historical provenance. Off unless `OPENALEX_ENABLED=true`. |
-| `score` | Deterministic component scores + `CANDIDATE` label |
-| `show` | Print top N from the **candidate pool** |
+| `score` | Deterministic component scores + `CANDIDATE` label. Kept in the codebase but unwired from `all` (scoring v2 replaces it) — still runnable manually via `--stage score`. |
+| `final-score` | Combines stored quality + independence + verified org/person signals into `content_final_scores` (`radar-v1` or `radar-v2` profile). Only `scoring_tier='full'` (or untiered v1) rows are scored — screen-tier rows never get a `final_score` row. Free — reads only stored data. |
+| `report` | Markdown Top-N report; `--rank-by research\|newsletter` (radar-v2 only); prints how many papers were screened vs fully scored so the reader knows the pool the Top N was drawn from. |
+| `show` | Print top N from the **candidate pool** (legacy deterministic-score pool) |
 
-`CANDIDATE` is a candidate pool, not automatically the final Top N list. `show --top 20` ranks the top 20 from that pool by intrinsic score.
+`CANDIDATE` is a candidate pool, not automatically the final Top N list. `show --top 20` ranks the top 20 from that pool by intrinsic score; the LLM-scored ranking is `--stage report`.
 
-The `all` stage runs the same stage functions in the same order as the staged pipeline.
+The `all` stage runs ingest → relevance → enrich → entities only — it no longer runs deterministic `score`, and never runs a paid stage.
+
+**Tiering config** (env-driven, never hardcoded):
+- `GATE_PERCENTILE` (default `15`) — set from a measured recall test (`scripts/validate_scoring.py --test tier-recall`), never from a cost target.
+- `SCREEN_MODEL` (default `anthropic/claude-haiku-4.5`) — the cheap, non-reasoning pass-1 model.
+- `SCORING_CONCURRENCY` (default `4`) — shared worker-pool size for screen/pass-2/independence; each worker uses its own DB connection, and a 429 permanently shrinks the pool's effective concurrency for the rest of that run. Does not apply to `enrich`, which keeps its own hardcoded ~3s arXiv throttle.
 
 ## Forward vs historical ingestion
 
@@ -69,11 +83,20 @@ Scoring is a **hand-written weighted heuristic**, not an LLM. Component dimensio
 - **Industry relevance** is **not yet semantically scored** — the column exists but deterministic scoring does not populate it.
 - Full provenance is stored in `content_scores.scoring_reason` (`method`, `version`, `matched_rules`, weights).
 
-**LLM semantic scoring is implemented** as a separate assessment layer (`semantic-score`),
-using OpenRouter + `openai/gpt-5.6-sol`, prompt version `research-semantic-v1`. It writes to
-`content_score_assessments` and does **not** currently overwrite `content_items.status` —
-production `CANDIDATE` labels still come from the deterministic score. A final-ranking stage
-that combines semantic quality + verified organisation/person signals is still to be built.
+**LLM semantic scoring v2** is the current design: three separate OpenRouter calls per paper,
+never merged. Quality is now two tiers — pass 1 (`screen`, `SCREEN_MODEL`, no reasoning, batched
+15, 4 dimensions, no prose, prompt version `research-screen-v2`) gates who reaches pass 2
+(`semantic-score`, `openai/gpt-5.6-sol` with reasoning, full rubric, batched 5, prompt version
+`research-semantic-v2`) — only the top `GATE_PERCENTILE`% of screen scores proceed. Independence
+(`independence`, title+abstract+affiliation_text, prompt version `independence-v1`, batched 20)
+then runs only on that same pass-2 pool — classifying a paper that screened out is wasted spend.
+`final-score` combines quality × evidence_factor × independence_factor with verified
+organisation/person boosts into `research_score` and `newsletter_score`, and computes ONLY for
+`scoring_tier='full'` papers — two models have two scales and are never mixed into one ranking.
+v1 assessments (`research-semantic-v1`) are left in place under their own prompt_version for
+comparison via `scripts/validate_scoring.py`; they are not deleted or migrated. See
+`sql/010_scoring_v2.sql` and `scripts/validate_scoring.py` for the full design and validation
+harness (including `--test tier-recall`, which is required before trusting `GATE_PERCENTILE`).
 
 ## OpenAlex external affiliation
 

@@ -2055,7 +2055,7 @@ def print_top_candidates(top=10):
             )
 
 
-PAID_STAGES = frozenset({"affiliation-gpt", "semantic-score"})
+PAID_STAGES = frozenset({"affiliation-gpt", "screen", "independence", "semantic-score"})
 
 
 class PaidStageNotAuthorised(RuntimeError):
@@ -2076,6 +2076,8 @@ def run_stage(
     diagnose=False,
     out=None,
     top=None,
+    rank_by=None,
+    gate_percentile=None,
 ):
     if stage in PAID_STAGES and not dry_run and not allow_paid:
         raise PaidStageNotAuthorised(
@@ -2113,15 +2115,38 @@ def run_stage(
                     force=force,
                 )
             elif stage == "score":
+                # Deterministic scoring — kept unwired from `all` (brief §7). The
+                # function stays available for manual/legacy use via --stage score.
                 stage_score(conn, run_id, limit=limit)
-            elif stage == "semantic-score":
-                from research_radar.semantic_scoring import stage_semantic_score
+            elif stage == "screen":
+                from research_radar.semantic_scoring import stage_screen
 
-                stage_semantic_score(
+                stage_screen(
+                    conn,
+                    run_id,
+                    limit=limit,
+                    dry_run=dry_run,
+                    force=force,
+                )
+            elif stage == "semantic-score":
+                from research_radar.semantic_scoring import stage_semantic_score_v2
+
+                stage_semantic_score_v2(
                     conn,
                     run_id,
                     sample=sample if sample is not None else (100 if not full else None),
                     full=full,
+                    dry_run=dry_run,
+                    force=force,
+                    gate_percentile=gate_percentile,
+                )
+            elif stage == "independence":
+                from research_radar.independence import stage_independence
+
+                stage_independence(
+                    conn,
+                    run_id,
+                    limit=limit,
                     dry_run=dry_run,
                     force=force,
                 )
@@ -2129,6 +2154,18 @@ def run_stage(
                 from research_radar.semantic_scoring import print_semantic_compare
 
                 print_semantic_compare(conn, limit=limit or 20)
+            elif stage == "scoring-cost":
+                # Free — zero API calls, ever. Cost projection for a full run
+                # (pass 1 over everything not yet screened, pass 2 +
+                # independence over the gated top gate_percentile%) over
+                # whatever's currently eligible. Deliverable §3 of the tiering
+                # brief: check a full-corpus cost before committing to it.
+                from research_radar.llm_batch import print_scoring_cost_summary
+                from research_radar.semantic_scoring import project_full_run_costs
+
+                projection = project_full_run_costs(conn, gate_percentile=gate_percentile)
+                print("\nSCORING COST PROJECTION (dry, zero API calls)")
+                print_scoring_cost_summary(**projection)
             elif stage == "final-score":
                 from research_radar.final_score import print_distribution, stage_final_score
 
@@ -2144,18 +2181,28 @@ def run_stage(
                     )
             elif stage == "report":
                 from research_radar.final_score import count_ranked, load_top, render_markdown
+                from research_radar.semantic_scoring import GATE_PERCENTILE, count_scoring_pool
 
                 rows = load_top(
                     conn,
                     profile=profile,
                     top=top or 20,
                     since_days=since_days,
+                    rank_by=rank_by or "research",
+                )
+                pool = count_scoring_pool(conn)
+                print(
+                    f"\nSCORING POOL: {pool['screened']} papers screened, "
+                    f"{pool['full']} fully scored (top {GATE_PERCENTILE:g}% gate) "
+                    f"— Top {top or 20} is drawn from the {pool['full']} fully-scored pool, not the {pool['screened']} screened."
                 )
                 md = render_markdown(
                     rows,
                     profile=profile,
                     since_days=since_days,
                     corpus_n=count_ranked(conn, profile=profile),
+                    rank_by=rank_by or "research",
+                    pool=pool,
                 )
                 if out:
                     with open(out, "w", encoding="utf-8") as fh:
@@ -2165,12 +2212,16 @@ def run_stage(
                     print(md)
             elif stage == "all":
                 # `all` is the free/unattended path. Paid stages (affiliation-gpt,
-                # semantic-score) are run explicitly with --allow-paid, never on cron.
+                # screen, semantic-score, independence — run in that order) are
+                # invoked explicitly with --allow-paid, never on cron. The
+                # deterministic `score` stage is no longer part of this flow
+                # (brief §7) — it stays available via --stage score for
+                # manual/legacy use, but final ranking now comes from
+                # screen -> semantic-score -> independence -> final-score.
                 stage_ingest(conn, run_id, limit=limit)
                 stage_relevance(conn, run_id, limit=limit)
                 stage_enrich(conn, run_id, limit=limit)
                 stage_entities(conn, run_id, limit=limit)
-                stage_score(conn, run_id, limit=limit)
             else:
                 raise ValueError(f"Unknown stage: {stage}")
             finish_run(conn, run_id, starting_calls, ok=True)
@@ -2203,8 +2254,11 @@ def main():
             "openalex-retry",
             "affiliation-gpt",
             "score",
+            "screen",
             "semantic-score",
+            "independence",
             "semantic-compare",
+            "scoring-cost",
             "final-score",
             "report",
             "show",
@@ -2219,32 +2273,38 @@ def main():
         "--sample",
         type=int,
         default=None,
-        help="semantic-score: reproducible sample size (must be divisible by 4; default 100)",
+        help="semantic-score: sample size, randomly composed (default 100)",
     )
     ap.add_argument(
         "--full",
         action="store_true",
-        help="semantic-score: score all SCORED/CANDIDATE papers (explicit; not default)",
+        help="semantic-score / independence: score all eligible ENTITY_RESOLVED papers (explicit; not default)",
     )
     ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="semantic-score / affiliation-gpt / final-score: estimate only; zero OpenRouter calls / writes",
+        help="semantic-score / independence / affiliation-gpt / final-score: estimate only; zero OpenRouter calls / writes",
     )
     ap.add_argument(
         "--force",
         action="store_true",
-        help="semantic-score / affiliation-gpt: overwrite existing assessment for same model/prompt version",
+        help="semantic-score / independence / affiliation-gpt: overwrite existing assessment for same model/prompt version",
     )
     ap.add_argument(
         "--allow-paid",
         action="store_true",
-        help="Required to run a stage that makes paid OpenRouter calls (affiliation-gpt, semantic-score)",
+        help="Required to run a stage that makes paid OpenRouter calls (affiliation-gpt, screen, semantic-score, independence)",
+    )
+    ap.add_argument(
+        "--gate-percentile",
+        type=float,
+        default=None,
+        help="semantic-score / scoring-cost: override GATE_PERCENTILE env for this run (top X%% of screen scores that reach pass 2)",
     )
     ap.add_argument(
         "--profile",
         default=None,
-        help="final-score / report: weight profile (default radar-v1)",
+        help="final-score / report: weight profile (default radar-v1; use radar-v2 for scoring-v2 assessments)",
     )
     ap.add_argument(
         "--since-days",
@@ -2261,6 +2321,12 @@ def main():
         "--out",
         default=None,
         help="report: write markdown to this path instead of stdout",
+    )
+    ap.add_argument(
+        "--rank-by",
+        choices=["research", "newsletter"],
+        default="research",
+        help="report: rank by research_score or newsletter_score (default research; radar-v2 only)",
     )
     args = ap.parse_args()
 
@@ -2284,6 +2350,8 @@ def main():
         diagnose=args.diagnose,
         out=args.out,
         top=args.top,
+        rank_by=args.rank_by,
+        gate_percentile=args.gate_percentile,
     )
     print(f"\nSTAGE COMPLETED: {args.stage} run_id={run_id}")
     if args.stage in {"score", "all"}:

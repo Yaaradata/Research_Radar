@@ -8,12 +8,24 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
+
+from research_radar.llm_batch import (
+    AdaptiveConcurrencyGate,
+    LLMBatchError,
+    SCORING_CONCURRENCY,
+    call_chat_completion,
+    cost_summary_line,
+    random_batches,
+    strip_json_fences,
+)
 
 log = logging.getLogger("research-radar")
 
@@ -1057,3 +1069,1388 @@ def print_semantic_compare(conn, *, limit: int = 20, prompt_version: str | None 
             f"  id={r['content_id']} delta={r['rank_delta']:+d} "
             f"old_rk={r['old_rank']} gpt_rk={r['gpt_rank']} {(r.get('title') or '')[:60]}"
         )
+
+
+# ===========================================================================
+# Scoring v2 — quality scorer (Call A). Title + abstract + categories ONLY.
+#
+# This is a separate model call from independence.py (Call B), which is the
+# only module that ever sees affiliation_text. That separation is a hard
+# architectural guarantee, not a prompt instruction: this section must never
+# import from independence.py or accept an affiliation/author/organisation
+# parameter. Do not merge the two calls to save cost.
+#
+# v1 (above) is left untouched — its assessment rows stay under
+# prompt_version="research-semantic-v1" and are never deleted, overwritten or
+# migrated. stage_semantic_score (v1) is no longer wired into the pipeline;
+# stage_semantic_score_v2 is what `--stage semantic-score` now runs.
+# ===========================================================================
+
+QUALITY_PROMPT_VERSION = (
+    os.getenv("QUALITY_PROMPT_VERSION", "research-semantic-v2").strip() or "research-semantic-v2"
+)
+QUALITY_BATCH_SIZE = int(os.getenv("QUALITY_BATCH_SIZE", "5"))
+QUALITY_REASONING_EFFORT = os.getenv("QUALITY_REASONING_EFFORT", "medium").strip() or "medium"
+QUALITY_MAX_RETRIES = int(os.getenv("QUALITY_MAX_RETRIES", "3"))
+QUALITY_REQUEST_SLEEP = float(os.getenv("QUALITY_REQUEST_SLEEP", "0.2"))
+QUALITY_DEFAULT_SAMPLE = int(os.getenv("QUALITY_DEFAULT_SAMPLE", "100"))
+
+# Fraction of screened papers (by mean of the four screen dimensions, after
+# excluding ai_relevance <= 3) that proceed to pass 2 / independence. Set from
+# a measured recall test (scripts/validate_scoring.py --test tier-recall),
+# never chosen from a cost target — see that test's docstring.
+GATE_PERCENTILE = float(os.getenv("GATE_PERCENTILE", "15"))
+
+# Pass 1 (screen) config — a cheap, non-reasoning model; see the SCREEN_*
+# section near the bottom of this file for the prompt/schema/parse/call/stage
+# functions. Declared here (not there) so load_gated_quality_candidates below
+# can reference SCREEN_PROMPT_VERSION without a forward-reference.
+SCREEN_MODEL = os.getenv("SCREEN_MODEL", "anthropic/claude-haiku-4.5").strip() or "anthropic/claude-haiku-4.5"
+SCREEN_PROMPT_VERSION = (
+    os.getenv("SCREEN_PROMPT_VERSION", "research-screen-v2").strip() or "research-screen-v2"
+)
+SCREEN_BATCH_SIZE = int(os.getenv("SCREEN_BATCH_SIZE", "15"))
+SCREEN_MAX_RETRIES = int(os.getenv("SCREEN_MAX_RETRIES", "3"))
+SCREEN_REQUEST_SLEEP = float(os.getenv("SCREEN_REQUEST_SLEEP", "0.2"))
+
+QUALITY_NUMERIC_FIELDS = [
+    "ai_relevance",
+    "technical_significance",
+    "apparent_novelty",
+    "practical_applicability",
+    "professional_value",
+    "learning_value",
+    "evidence_strength",
+    "newsletter_fit",
+    "confidence",
+]
+QUALITY_TEXT_FIELDS = ["so_what", "reason_not_higher"]
+
+QUALITY_SYSTEM_PROMPT = """You score AI research papers for TheNeural, a research intelligence system
+that also feeds a weekly AI newsletter read by working technology and product
+professionals, and by students entering the field.
+
+You are given each paper's title, arXiv categories and abstract. You are NOT
+told who wrote it or where they work. Do not guess, and do not let a familiar
+research style, dataset or terminology lead you to infer a laboratory.
+
+SEPARATING CONTRIBUTION FROM EVIDENCE
+
+Score the apparent contribution on each quality dimension separately from how
+well that contribution is evidenced.
+
+Do NOT reduce technical_significance, apparent_novelty,
+practical_applicability, professional_value or learning_value merely because
+the abstract provides weak evidence. Score how important the claimed
+contribution would be if it holds.
+
+Put ALL uncertainty about whether it holds into evidence_strength and
+confidence.
+
+Never invent a contribution, result or number that is not stated. If the
+abstract does not say what was achieved, the contribution you are scoring is
+whatever it actually claims, which may be very little.
+
+SCORING PRINCIPLES
+
+Most papers are ordinary. A typical arXiv submission is competent,
+incremental work advancing a narrow question. That is a 5 or 6. Expect most
+papers to land there, but this is a description of the field, not a quota -
+if a batch genuinely contains three strong papers, score three strong papers.
+
+Do not reward familiar terminology. "Transformer", "state-of-the-art",
+"foundation model", "agentic" and similar terms tell you nothing about
+quality.
+
+Treat novelty as APPARENT novelty from this abstract alone. You cannot know
+the full prior literature.
+
+Results reported by the authors are internally reported evidence.
+Independent replication is stronger, but self-reported results are still
+findings - do not dismiss them. Reflect the difference in evidence_strength.
+
+Judge each paper on its own merits against the absolute scale below. Do NOT
+score papers relative to the others in this batch. A batch of weak papers
+does not make the least weak one strong.
+
+GATE: Score ai_relevance first. If ai_relevance is 3 or below, the paper is
+off-topic for this system - score every other dimension at 3 or below
+regardless of how rigorous the work is.
+
+SCALE
+
+All scores are 0.0 to 10.0 in 0.5 increments. Valid values: 0.0, 0.5, 1.0,
+1.5 ... 9.5, 10.0. Do not return other values.
+
+0-2     Weak. Trivial, unsupported, or off-topic.
+3-4     Below average. Minor contribution.
+5-6     Ordinary. Competent incremental work. MOST PAPERS BELONG HERE.
+7-8     Strong. A clear contribution that matters.
+9       Exceptional. Changes how a practitioner approaches the problem.
+10      Reserved. Requires an unusually strong claim clearly stated in this
+        abstract.
+
+DIMENSIONS
+
+ai_relevance            Is this AI, ML, or their direct application? (GATE)
+technical_significance  If the claim holds, does it change what is
+                        technically possible or understood?
+apparent_novelty        Is the core idea new, or a known idea applied again?
+practical_applicability If it holds, could a practitioner use this within a
+                        year?
+professional_value      Would it change a technical or product decision?
+learning_value          Is it worth reading to understand where the field is
+                        going?
+evidence_strength       Does the abstract REPORT results, or only claim them?
+                        Numbers, named baselines, named datasets, ablations
+                        and stated limitations raise this. Vague superlatives
+                        lower it. This is the ONLY dimension where weak
+                        evidence should lower the number.
+
+NEWSLETTER FIT - a SEPARATE question
+
+newsletter_fit asks something different from research quality: could we tell
+a busy professional something useful about this in one line, and would they
+care? A rigorous incremental paper can be excellent research and a poor
+newsletter item. A simple result with a striking implication can be the
+reverse. Score independently of the dimensions above.
+
+High: a concrete result a reader can act on or repeat, a finding that
+contradicts a common assumption, something that changes a build-or-buy
+decision.
+Low: incremental benchmark gains, work meaningful only inside a narrow
+subfield, results needing heavy background to understand.
+
+ALSO RETURN PER PAPER
+
+so_what            One line, max 20 words. What this means for a working
+                   professional. Not a summary of the abstract.
+reason_not_higher  The single strongest reason this is not scored higher.
+                   ALWAYS give one, even for a paper you scored 9.
+confidence         0-10 in 0.5 increments. How sure you are given only what
+                   this abstract actually contains.
+
+Return ONLY a JSON object with a single key "papers", whose value is an array
+with one object per paper, in the order supplied. No prose, no markdown
+fences.
+"""
+
+# Built from QUALITY_NUMERIC_FIELDS/QUALITY_TEXT_FIELDS so the schema can never
+# drift out of sync with the parser's own field list.
+QUALITY_ITEM_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "paper_id": {"type": "integer"},
+        **{k: {"type": "number"} for k in QUALITY_NUMERIC_FIELDS},
+        **{k: {"type": "string"} for k in QUALITY_TEXT_FIELDS},
+    },
+    "required": ["paper_id", *QUALITY_NUMERIC_FIELDS, *QUALITY_TEXT_FIELDS],
+}
+
+QUALITY_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "papers": {"type": "array", "items": QUALITY_ITEM_SCHEMA},
+    },
+    "required": ["papers"],
+}
+
+
+class QualityParseError(ValueError):
+    pass
+
+
+def normalize_half_point(value: Any) -> tuple[float, bool]:
+    """Clamp to 0-10 and round to nearest 0.5. Returns (value, was_rounded)."""
+    x = float(value)
+    x = max(0.0, min(10.0, x))
+    rounded = round(x * 2.0) / 2.0
+    was_rounded = abs(rounded - x) > 1e-9
+    return rounded, was_rounded
+
+
+def build_quality_paper_block(paper: dict) -> str:
+    """PAPER {id} / TITLE / CATEGORIES / ABSTRACT.
+
+    Reads ONLY title, categories, abstract from `paper` — never affiliation,
+    author or organisation keys, even if present on the dict the caller
+    passed in (e.g. a row that also carries paper_metadata.affiliation_text
+    for the independence classifier's own use).
+    """
+    categories = paper.get("categories") or paper.get("categories_raw") or []
+    if isinstance(categories, str):
+        cat_text = categories
+    elif isinstance(categories, (list, tuple)):
+        cat_text = ", ".join(str(c) for c in categories if c)
+    else:
+        cat_text = ""
+    content_id = paper.get("content_id", paper.get("id"))
+    return (
+        f"PAPER {content_id}\n"
+        f"TITLE: {(paper.get('title') or '').strip()}\n"
+        f"CATEGORIES: {cat_text.strip() or '(none)'}\n"
+        f"ABSTRACT: {(paper.get('abstract') or paper.get('summary') or '').strip() or '(empty)'}\n"
+    )
+
+
+def build_quality_batch_user_prompt(papers: list[dict]) -> str:
+    return "\n\n".join(build_quality_paper_block(p) for p in papers)
+
+
+def assert_quality_prompt_is_paper_only(prompt: str):
+    """
+    Structural boundary only (same philosophy as v1's assert_prompt_is_paper_only):
+    do NOT scan for banned words, since paper text may legitimately discuss
+    affiliation networks, authorship, or organisations. What is enforced is
+    that the builder never emits an AFFILIATIONS/AUTHORS/ORGANISATION section —
+    those keys are never read by build_quality_paper_block in the first place.
+    """
+    if not isinstance(prompt, str):
+        raise QualityParseError("prompt must be a string")
+    if "AFFILIATIONS:" in prompt:
+        raise QualityParseError("quality prompt must not contain an AFFILIATIONS section")
+    if "AUTHORS:" in prompt or "ORGANISATION:" in prompt or "ORGANIZATION:" in prompt:
+        raise QualityParseError("quality prompt must not contain an author/organisation section")
+    if "TITLE:" not in prompt or "CATEGORIES:" not in prompt or "ABSTRACT:" not in prompt:
+        raise QualityParseError("prompt missing required paper-only sections")
+
+
+def parse_quality_batch(text: str, expected_ids: set[int]) -> tuple[dict[int, dict], int]:
+    """Parse the model's {"papers": [...]} object.
+
+    Returns ({content_id: {...}}, rounding_warning_count). strip_json_fences
+    handles accidental markdown-fence wrapping; the object shape itself is
+    enforced API-side by QUALITY_RESPONSE_SCHEMA (strict json_schema), so this
+    is a defensive re-check, not the primary validation.
+    """
+    raw = strip_json_fences(text)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise QualityParseError(f"invalid JSON from model: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise QualityParseError("response must be a JSON object with a 'papers' array")
+    items = payload.get("papers")
+    if not isinstance(items, list):
+        raise QualityParseError("response object missing 'papers' array")
+
+    out: dict[int, dict] = {}
+    rounding_warnings = 0
+    for item in items:
+        if not isinstance(item, dict):
+            raise QualityParseError("each item must be an object")
+        try:
+            pid = int(item.get("paper_id"))
+        except (TypeError, ValueError) as exc:
+            raise QualityParseError(f"invalid paper_id: {item.get('paper_id')!r}") from exc
+
+        dims: dict[str, Any] = {}
+        for key in QUALITY_NUMERIC_FIELDS:
+            if key not in item:
+                raise QualityParseError(f"paper {pid} missing dimension: {key}")
+            try:
+                raw_val = float(item[key])
+            except (TypeError, ValueError) as exc:
+                raise QualityParseError(f"paper {pid} non-numeric {key}: {item[key]!r}") from exc
+            if raw_val < 0.0 or raw_val > 10.0:
+                raise QualityParseError(f"paper {pid} {key} out of range 0-10: {raw_val}")
+            rounded, was_rounded = normalize_half_point(raw_val)
+            if was_rounded:
+                rounding_warnings += 1
+                log.warning(
+                    "Quality score not a 0.5 increment paper=%s dim=%s raw=%s rounded=%s",
+                    pid,
+                    key,
+                    raw_val,
+                    rounded,
+                )
+            dims[key] = rounded
+
+        for key in QUALITY_TEXT_FIELDS:
+            val = (item.get(key) or "").strip()
+            if not val:
+                raise QualityParseError(f"paper {pid} missing {key}")
+            dims[key] = val
+
+        if pid in expected_ids:
+            out[pid] = dims
+    return out, rounding_warnings
+
+
+def call_quality_batch(papers: list[dict], *, client=None, on_rate_limited=None) -> dict:
+    """One OpenRouter call for a batch of papers (title+categories+abstract only)."""
+    if client is None:
+        client = create_llm_client()
+    model = resolve_model_name()
+    user_prompt = build_quality_batch_user_prompt(papers)
+    assert_quality_prompt_is_paper_only(user_prompt)
+    expected_ids = {int(p.get("content_id", p.get("id"))) for p in papers}
+
+    result = call_chat_completion(
+        client,
+        model=model,
+        system_prompt=QUALITY_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        reasoning_effort=QUALITY_REASONING_EFFORT,
+        temperature=0.2,
+        max_retries=1,  # outer stage loop owns the batch-level retry/backoff
+        request_sleep=QUALITY_REQUEST_SLEEP,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "quality_assessment",
+                "strict": True,
+                "schema": QUALITY_RESPONSE_SCHEMA,
+            },
+        },
+        on_rate_limited=on_rate_limited,
+    )
+    parsed, rounding_warnings = parse_quality_batch(result["text"], expected_ids)
+    return {
+        "results": parsed,
+        "rounding_warnings": rounding_warnings,
+        "input_tokens": result["input_tokens"],
+        "output_tokens": result["output_tokens"],
+        "response_id": result["response_id"],
+        "estimated_cost_usd": estimate_cost_usd(result["input_tokens"], result["output_tokens"]),
+    }
+
+
+def call_quality_batch_with_retry(
+    papers: list[dict],
+    *,
+    client=None,
+    max_retries: int | None = None,
+    on_rate_limited=None,
+    batch_tag: str = "",
+) -> dict:
+    max_retries = max_retries if max_retries is not None else QUALITY_MAX_RETRIES
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return call_quality_batch(papers, client=client, on_rate_limited=on_rate_limited)
+        except (LLMBatchError, QualityParseError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                wait = min(60.0, 2 ** (attempt - 1))
+                log.warning(
+                    "[batch %s] Quality batch retry attempt=%s/%s size=%s err=%s",
+                    batch_tag,
+                    attempt,
+                    max_retries,
+                    len(papers),
+                    exc,
+                )
+                time.sleep(wait)
+                continue
+    raise last_exc
+
+
+@dataclass
+class QualityRunStats:
+    requested: int = 0
+    completed: int = 0
+    failed: int = 0
+    skipped_existing: int = 0
+    rounding_warnings: int = 0
+    batches: int = 0
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "requested": self.requested,
+            "completed": self.completed,
+            "failed": self.failed,
+            "skipped_existing": self.skipped_existing,
+            "rounding_warnings": self.rounding_warnings,
+            "batches": self.batches,
+            "calls": self.calls,
+            "batch_size": QUALITY_BATCH_SIZE,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "estimated_total_cost_usd": round(self.estimated_cost_usd, 6),
+            "model": resolve_model_name(),
+            "provider": LLM_PROVIDER,
+            "prompt_version": QUALITY_PROMPT_VERSION,
+            "reasoning_effort": QUALITY_REASONING_EFFORT,
+        }
+
+
+def quality_assessment_exists(conn, content_id: int) -> bool:
+    model = resolve_model_name()
+    row = conn.execute(
+        """
+        SELECT 1 AS ok
+        FROM research_radar.content_score_assessments
+        WHERE content_id = %s
+          AND provider = %s
+          AND model_name = %s
+          AND prompt_version = %s
+          AND status = 'COMPLETED'
+        LIMIT 1
+        """,
+        (content_id, LLM_PROVIDER, model, QUALITY_PROMPT_VERSION),
+    ).fetchone()
+    return bool(row)
+
+
+def upsert_quality_assessment(
+    conn,
+    *,
+    content_id: int,
+    sample_group: str,
+    batch_id,
+    batch_size: int,
+    batch_position: int,
+    result: dict,
+    scoring_tier: str = "full",
+):
+    sql = """
+        INSERT INTO research_radar.content_score_assessments(
+            content_id, assessment_type, provider, model_name, prompt_version,
+            sample_group, scoring_tier,
+            ai_relevance, technical_significance, apparent_novelty,
+            practical_applicability, professional_value,
+            learning_value, evidence_strength, newsletter_fit,
+            so_what, reason_not_higher, confidence,
+            batch_id, batch_size, batch_position,
+            reasons, industry_labels,
+            input_tokens, output_tokens, estimated_cost_usd,
+            response_id, status, error_message
+        ) VALUES (
+            %s, %s, %s, %s, %s,
+            %s, %s,
+            %s, %s, %s,
+            %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s::jsonb, %s::jsonb,
+            %s, %s, %s,
+            %s, %s, %s
+        )
+        ON CONFLICT (content_id, provider, model_name, prompt_version) DO UPDATE SET
+            sample_group = EXCLUDED.sample_group,
+            scoring_tier = EXCLUDED.scoring_tier,
+            ai_relevance = EXCLUDED.ai_relevance,
+            technical_significance = EXCLUDED.technical_significance,
+            apparent_novelty = EXCLUDED.apparent_novelty,
+            practical_applicability = EXCLUDED.practical_applicability,
+            professional_value = EXCLUDED.professional_value,
+            learning_value = EXCLUDED.learning_value,
+            evidence_strength = EXCLUDED.evidence_strength,
+            newsletter_fit = EXCLUDED.newsletter_fit,
+            so_what = EXCLUDED.so_what,
+            reason_not_higher = EXCLUDED.reason_not_higher,
+            confidence = EXCLUDED.confidence,
+            batch_id = EXCLUDED.batch_id,
+            batch_size = EXCLUDED.batch_size,
+            batch_position = EXCLUDED.batch_position,
+            input_tokens = EXCLUDED.input_tokens,
+            output_tokens = EXCLUDED.output_tokens,
+            estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+            response_id = EXCLUDED.response_id,
+            status = EXCLUDED.status,
+            error_message = EXCLUDED.error_message,
+            created_at = NOW()
+    """
+    params = (
+        content_id,
+        ASSESSMENT_TYPE,
+        LLM_PROVIDER,
+        resolve_model_name(),
+        QUALITY_PROMPT_VERSION,
+        sample_group,
+        scoring_tier,
+        result.get("ai_relevance"),
+        result.get("technical_significance"),
+        result.get("apparent_novelty"),
+        result.get("practical_applicability"),
+        result.get("professional_value"),
+        result.get("learning_value"),
+        result.get("evidence_strength"),
+        result.get("newsletter_fit"),
+        result.get("so_what"),
+        result.get("reason_not_higher"),
+        result.get("confidence"),
+        batch_id,
+        batch_size,
+        batch_position,
+        json.dumps({}),
+        json.dumps([]),
+        result.get("input_tokens"),
+        result.get("output_tokens"),
+        result.get("estimated_cost_usd"),
+        result.get("response_id"),
+        result.get("status") or "COMPLETED",
+        result.get("error_message"),
+    )
+    conn.execute(sql, params)
+
+
+def load_quality_candidates(conn, limit: int | None = None) -> list[dict]:
+    """
+    ENTITY_RESOLVED, SCORED or CANDIDATE papers, title+categories+abstract only.
+    SCORED/CANDIDATE are included alongside ENTITY_RESOLVED because papers
+    ingested before the deterministic `score` stage was removed from `all`
+    already advanced past ENTITY_RESOLVED; both populations are equally
+    eligible for v2 (correction to the original brief, which said
+    ENTITY_RESOLVED *instead of* SCORED/CANDIDATE — that would have made this
+    stage select nothing for the entire pre-existing corpus).
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            ci.id AS content_id,
+            ci.title,
+            COALESCE(pm.categories, ci.categories_raw, '[]'::jsonb) AS categories,
+            COALESCE(pm.abstract, ci.summary, '') AS abstract
+        FROM research_radar.content_items ci
+        LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
+        WHERE ci.status IN ('ENTITY_RESOLVED', 'SCORED', 'CANDIDATE')
+        ORDER BY ci.id
+        LIMIT %s
+        """,
+        (limit or 10_000,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# Matches the GATE wording in both system prompts ("ai_relevance is 3 or below").
+SCREEN_AI_RELEVANCE_FLOOR = 3.0
+
+
+def select_gated_content_ids(conn, *, gate_percentile: float | None = None) -> list[int]:
+    """
+    Rank COMPLETED screen assessments by the mean of the four screen
+    dimensions, drop ai_relevance <= 3 outright, and return the content_ids in
+    the top `gate_percentile` percent. Pure Python ranking over a DB read —
+    same style as final_score.py's org/person boosts. Makes no API calls.
+    """
+    gate_percentile = GATE_PERCENTILE if gate_percentile is None else gate_percentile
+    rows = conn.execute(
+        """
+        SELECT content_id, ai_relevance, technical_significance, apparent_novelty, evidence_strength
+        FROM research_radar.content_score_assessments
+        WHERE prompt_version = %s AND scoring_tier = 'screen' AND status = 'COMPLETED'
+        """,
+        (SCREEN_PROMPT_VERSION,),
+    ).fetchall()
+
+    ranked: list[tuple[int, float]] = []
+    for r in rows:
+        ai_rel = r.get("ai_relevance")
+        if ai_rel is None or float(ai_rel) <= SCREEN_AI_RELEVANCE_FLOOR:
+            continue
+        dims = [r.get("ai_relevance"), r.get("technical_significance"), r.get("apparent_novelty"), r.get("evidence_strength")]
+        if any(d is None for d in dims):
+            continue
+        mean = sum(float(d) for d in dims) / len(dims)
+        ranked.append((int(r["content_id"]), mean))
+
+    ranked.sort(key=lambda x: (-x[1], x[0]))
+    k = math.ceil(len(ranked) * gate_percentile / 100.0)
+    return [cid for cid, _ in ranked[:k]]
+
+
+def load_gated_quality_candidates(
+    conn, *, gate_percentile: float | None = None, limit: int | None = None
+) -> list[dict]:
+    """Papers that passed the screen gate — the pool pass 2 actually scores."""
+    gated_ids = select_gated_content_ids(conn, gate_percentile=gate_percentile)
+    if not gated_ids:
+        return []
+    rows = conn.execute(
+        """
+        SELECT
+            ci.id AS content_id,
+            ci.title,
+            COALESCE(pm.categories, ci.categories_raw, '[]'::jsonb) AS categories,
+            COALESCE(pm.abstract, ci.summary, '') AS abstract
+        FROM research_radar.content_items ci
+        LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
+        WHERE ci.id = ANY(%s)
+        ORDER BY ci.id
+        LIMIT %s
+        """,
+        (gated_ids, limit or 10_000),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def estimate_quality_prompt_tokens(papers: list[dict]) -> int:
+    prompt = QUALITY_SYSTEM_PROMPT + build_quality_batch_user_prompt(papers)
+    return max(1, len(prompt) // 4)
+
+
+def stage_semantic_score_v2(
+    conn,
+    run_id,
+    *,
+    sample: int | None = None,
+    full: bool = False,
+    dry_run: bool = False,
+    force: bool = False,
+    gate_percentile: float | None = None,
+    client=None,
+):
+    """
+    Pass 2 — full quality scoring. Batch 5, randomly composed, random order
+    within batch. Runs ONLY on papers that passed the screen gate (top
+    `gate_percentile` percent of pass-1 scores, ai_relevance > 3) — see
+    load_gated_quality_candidates. Writes scoring_tier='full'.
+    """
+    gate_percentile = GATE_PERCENTILE if gate_percentile is None else gate_percentile
+
+    if not dry_run:
+        require_scoring_enabled()
+        require_api_key()
+
+    candidates = load_gated_quality_candidates(conn, gate_percentile=gate_percentile)
+    if not force:
+        candidates = [c for c in candidates if not quality_assessment_exists(conn, c["content_id"])]
+
+    if full:
+        selected = candidates
+        sample_group = "full"
+    else:
+        n = int(sample or QUALITY_DEFAULT_SAMPLE)
+        selected = candidates if len(candidates) <= n else random.sample(candidates, n)
+        sample_group = "random"
+
+    stats = QualityRunStats(requested=len(selected))
+    batches = random_batches(selected, QUALITY_BATCH_SIZE)
+    stats.batches = len(batches)
+
+    if dry_run:
+        est_in = sum(estimate_quality_prompt_tokens(b) for b in batches)
+        est_out = 220 * len(selected)  # structured-JSON-per-paper heuristic
+        stats.input_tokens = est_in
+        stats.output_tokens = est_out
+        stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
+        stats.calls = len(batches)
+        summary = stats.to_dict()
+        summary["gate_percentile"] = gate_percentile
+        conn.execute(
+            "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
+            (json.dumps({"semantic_score_v2_dry_run": summary}), run_id),
+        )
+        log.info("Quality v2 DRY RUN: %s", json.dumps(summary))
+        print("\nSEMANTIC SCORE V2 (PASS 2) DRY RUN")
+        for k, v in summary.items():
+            print(f"  {k}: {v}")
+        print(cost_summary_line("Pass 2:", stats.requested, stats.calls, stats.estimated_cost_usd))
+        return stats
+
+    if client is None:
+        client = create_llm_client()
+
+    gate = AdaptiveConcurrencyGate(SCORING_CONCURRENCY)
+
+    def _process_batch(batch: list[dict]) -> list[tuple[str, dict, int]]:
+        from research_radar.pipeline import bump, connect as _connect, event
+
+        batch_id = uuid.uuid4()
+        batch_tag = str(batch_id)[:8]
+        batch_size = len(batch)
+        positioned = {int(p["content_id"]): (i + 1, p) for i, p in enumerate(batch)}
+        outcomes: list[tuple[str, dict, int]] = []
+
+        gate.acquire()
+        try:
+            try:
+                result = call_quality_batch_with_retry(
+                    batch, client=client, on_rate_limited=gate.report_rate_limited, batch_tag=batch_tag
+                )
+                stats.calls += 1
+            except (LLMBatchError, QualityParseError) as exc:
+                log.warning("[batch %s] Quality batch failed entirely; falling back to individual calls: %s", batch_tag, exc)
+                result = None
+
+            parsed: dict[int, dict] = {}
+            rounding_warnings = 0
+            if result is not None:
+                parsed = result["results"]
+                rounding_warnings = result["rounding_warnings"]
+                stats.input_tokens += int(result["input_tokens"] or 0)
+                stats.output_tokens += int(result["output_tokens"] or 0)
+                stats.estimated_cost_usd += float(result["estimated_cost_usd"] or 0)
+
+            missing_ids = set(positioned.keys()) - set(parsed.keys())
+            for pid in missing_ids:
+                pos, paper = positioned[pid]
+                try:
+                    single = call_quality_batch_with_retry(
+                        [paper], client=client, on_rate_limited=gate.report_rate_limited, batch_tag=batch_tag
+                    )
+                    stats.calls += 1
+                    r = single["results"].get(pid)
+                    if r is None:
+                        raise QualityParseError(f"paper {pid} missing from individual retry response too")
+                    stats.input_tokens += int(single["input_tokens"] or 0)
+                    stats.output_tokens += int(single["output_tokens"] or 0)
+                    stats.estimated_cost_usd += float(single["estimated_cost_usd"] or 0)
+                    rounding_warnings += single["rounding_warnings"]
+                    with _connect() as wconn:
+                        upsert_quality_assessment(
+                            wconn,
+                            content_id=pid,
+                            sample_group=sample_group,
+                            batch_id=batch_id,
+                            batch_size=batch_size,
+                            batch_position=pos,
+                            scoring_tier="full",
+                            result={
+                                **r,
+                                "input_tokens": single["input_tokens"],
+                                "output_tokens": single["output_tokens"],
+                                "estimated_cost_usd": single["estimated_cost_usd"],
+                                "response_id": single["response_id"],
+                                "status": "COMPLETED",
+                            },
+                        )
+                        event(
+                            wconn, run_id, pid, "semantic_score", "completed", True,
+                            {"individual_retry": True, "ai_relevance": r.get("ai_relevance"), "batch": batch_tag},
+                        )
+                        wconn.commit()
+                    outcomes.append(("completed", {"content_id": pid}, pos))
+                except Exception as exc:
+                    with _connect() as wconn:
+                        upsert_quality_assessment(
+                            wconn,
+                            content_id=pid,
+                            sample_group=sample_group,
+                            batch_id=batch_id,
+                            batch_size=batch_size,
+                            batch_position=pos,
+                            scoring_tier="full",
+                            result={"status": "ERROR", "error_message": str(exc)[:1000]},
+                        )
+                        event(wconn, run_id, pid, "semantic_score", "error", False, {"batch": batch_tag}, str(exc))
+                        bump(wconn, run_id, "errors")
+                        wconn.commit()
+                    outcomes.append(("failed", {"content_id": pid, "error": str(exc)}, pos))
+
+            if parsed:
+                with _connect() as wconn:
+                    for pid, r in parsed.items():
+                        pos, _paper = positioned[pid]
+                        upsert_quality_assessment(
+                            wconn,
+                            content_id=pid,
+                            sample_group=sample_group,
+                            batch_id=batch_id,
+                            batch_size=batch_size,
+                            batch_position=pos,
+                            scoring_tier="full",
+                            result={**r, "status": "COMPLETED", "response_id": result.get("response_id") if result else None},
+                        )
+                        event(
+                            wconn, run_id, pid, "semantic_score", "completed", True,
+                            {"ai_relevance": r.get("ai_relevance"), "batch_size": batch_size, "batch": batch_tag},
+                        )
+                    wconn.commit()
+                for pid in parsed:
+                    pos, _ = positioned[pid]
+                    outcomes.append(("completed", {"content_id": pid}, pos))
+
+            stats.rounding_warnings += rounding_warnings
+            return outcomes
+        finally:
+            gate.release()
+
+    workers = max(1, SCORING_CONCURRENCY)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_process_batch, b) for b in batches]
+        done_batches = 0
+        for fut in as_completed(futures):
+            for kind, payload, _pos in fut.result():
+                if kind == "completed":
+                    stats.completed += 1
+                else:
+                    stats.failed += 1
+            done_batches += 1
+            log.info("Quality v2 (pass 2) batches progress %d/%d concurrency_ceiling=%d", done_batches, len(batches), gate.ceiling)
+
+    summary = stats.to_dict()
+    summary["gate_percentile"] = gate_percentile
+    conn.execute(
+        "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
+        (json.dumps({"semantic_score_v2_stats": summary}), run_id),
+    )
+    log.info("Quality v2 stats: %s", json.dumps(summary))
+    print("\nSEMANTIC SCORE V2 (PASS 2) SUMMARY")
+    for k, v in summary.items():
+        print(f"  {k}: {v}")
+    print(cost_summary_line("Pass 2:", stats.completed, stats.calls, stats.estimated_cost_usd))
+    return stats
+
+
+# ===========================================================================
+# Pass 1 — screen. Cheap, non-reasoning model, four dimensions, no prose.
+#
+# Same architectural guarantee as pass 2: title+categories+abstract only,
+# never affiliation (build_quality_paper_block is reused verbatim). Writes to
+# the SAME content_score_assessments table as pass 2, distinguished by
+# prompt_version='research-screen-v2' and scoring_tier='screen'.
+# ===========================================================================
+
+SCREEN_NUMERIC_FIELDS = ["ai_relevance", "technical_significance", "apparent_novelty", "evidence_strength"]
+
+
+def resolve_screen_model() -> str:
+    model = SCREEN_MODEL
+    return model if "/" in model else f"openai/{model}"
+
+
+def _extract_gate_and_scale(system_prompt: str) -> str:
+    """Pull the GATE + SCALE sections out of QUALITY_SYSTEM_PROMPT verbatim —
+    by slicing the shared source text rather than retyping it, the two
+    prompts' anchors cannot drift apart (brief §1: "same absolute anchors")."""
+    start = system_prompt.index("GATE: Score ai_relevance first.")
+    end = system_prompt.index("\n\nDIMENSIONS", start)
+    return system_prompt[start:end].strip()
+
+
+SCREEN_SYSTEM_PROMPT = (
+    "You are a fast, cheap first-pass screen for AI research papers for "
+    "TheNeural, a research intelligence system. Score four dimensions only, "
+    "with no explanation, so the strongest papers can be sent to a slower, "
+    "more careful second pass.\n\n"
+    "You are given each paper's title, arXiv categories and abstract. You are "
+    "NOT told who wrote it or where they work. Do not guess, and do not let "
+    "a familiar research style, dataset or terminology lead you to infer a "
+    "laboratory.\n\n"
+    "Judge each paper on its own merits against the absolute scale below. Do "
+    "NOT score papers relative to the others in this batch.\n\n"
+    + _extract_gate_and_scale(QUALITY_SYSTEM_PROMPT)
+    + "\n\n"
+    "DIMENSIONS (score these four only)\n\n"
+    "ai_relevance            Is this AI, ML, or their direct application? (GATE)\n"
+    "technical_significance  If the claim holds, does it change what is\n"
+    "                        technically possible or understood?\n"
+    "apparent_novelty        Is the core idea new, or a known idea applied again?\n"
+    "evidence_strength       Does the abstract REPORT results, or only claim them?\n"
+    "                        Numbers, named baselines, named datasets, ablations\n"
+    "                        and stated limitations raise this. Vague superlatives\n"
+    "                        lower it.\n\n"
+    "No per-dimension reasons, no so_what, no reason_not_higher. Output tokens "
+    "dominate cost and screening does not need explanations.\n\n"
+    "Return ONLY a JSON object with a single key \"papers\", whose value is an "
+    "array with one object per paper, in the order supplied. No reasons, no "
+    "prose, no markdown fences.\n"
+    '{"papers": [{"paper_id": <int>, "ai_relevance": <0-10>, '
+    '"technical_significance": <0-10>, "apparent_novelty": <0-10>, '
+    '"evidence_strength": <0-10>}]}\n'
+)
+
+SCREEN_ITEM_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "paper_id": {"type": "integer"},
+        **{k: {"type": "number"} for k in SCREEN_NUMERIC_FIELDS},
+    },
+    "required": ["paper_id", *SCREEN_NUMERIC_FIELDS],
+}
+
+SCREEN_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "papers": {"type": "array", "items": SCREEN_ITEM_SCHEMA},
+    },
+    "required": ["papers"],
+}
+
+
+class ScreenParseError(ValueError):
+    pass
+
+
+def build_screen_batch_user_prompt(papers: list[dict]) -> str:
+    """Same paper-only block as pass 2 — reused, not reimplemented, so the
+    blind-prompt guarantee has exactly one code path to audit."""
+    return build_quality_batch_user_prompt(papers)
+
+
+def parse_screen_batch(text: str, expected_ids: set[int]) -> tuple[dict[int, dict], int]:
+    raw = strip_json_fences(text)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ScreenParseError(f"invalid JSON from model: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ScreenParseError("response must be a JSON object with a 'papers' array")
+    items = payload.get("papers")
+    if not isinstance(items, list):
+        raise ScreenParseError("response object missing 'papers' array")
+
+    out: dict[int, dict] = {}
+    rounding_warnings = 0
+    for item in items:
+        if not isinstance(item, dict):
+            raise ScreenParseError("each item must be an object")
+        try:
+            pid = int(item.get("paper_id"))
+        except (TypeError, ValueError) as exc:
+            raise ScreenParseError(f"invalid paper_id: {item.get('paper_id')!r}") from exc
+
+        dims: dict[str, float] = {}
+        for key in SCREEN_NUMERIC_FIELDS:
+            if key not in item:
+                raise ScreenParseError(f"paper {pid} missing dimension: {key}")
+            try:
+                raw_val = float(item[key])
+            except (TypeError, ValueError) as exc:
+                raise ScreenParseError(f"paper {pid} non-numeric {key}: {item[key]!r}") from exc
+            if raw_val < 0.0 or raw_val > 10.0:
+                raise ScreenParseError(f"paper {pid} {key} out of range 0-10: {raw_val}")
+            rounded, was_rounded = normalize_half_point(raw_val)
+            if was_rounded:
+                rounding_warnings += 1
+                log.warning("Screen score not a 0.5 increment paper=%s dim=%s raw=%s rounded=%s", pid, key, raw_val, rounded)
+            dims[key] = rounded
+
+        if pid in expected_ids:
+            out[pid] = dims
+    return out, rounding_warnings
+
+
+def call_screen_batch(papers: list[dict], *, client=None, on_rate_limited=None) -> dict:
+    if client is None:
+        client = create_llm_client()
+    model = resolve_screen_model()
+    user_prompt = build_screen_batch_user_prompt(papers)
+    assert_quality_prompt_is_paper_only(user_prompt)  # same blind-prompt guarantee as pass 2
+    expected_ids = {int(p.get("content_id", p.get("id"))) for p in papers}
+
+    result = call_chat_completion(
+        client,
+        model=model,
+        system_prompt=SCREEN_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        reasoning_effort=None,  # reasoning disabled — cheap non-reasoning model
+        temperature=0.0,
+        max_retries=1,  # outer stage loop owns the batch-level retry/backoff
+        request_sleep=SCREEN_REQUEST_SLEEP,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "screen_assessment",
+                "strict": True,
+                "schema": SCREEN_RESPONSE_SCHEMA,
+            },
+        },
+        on_rate_limited=on_rate_limited,
+    )
+    parsed, rounding_warnings = parse_screen_batch(result["text"], expected_ids)
+    return {
+        "results": parsed,
+        "rounding_warnings": rounding_warnings,
+        "input_tokens": result["input_tokens"],
+        "output_tokens": result["output_tokens"],
+        "response_id": result["response_id"],
+        "estimated_cost_usd": estimate_cost_usd(result["input_tokens"], result["output_tokens"]),
+    }
+
+
+def call_screen_batch_with_retry(
+    papers: list[dict],
+    *,
+    client=None,
+    max_retries: int | None = None,
+    on_rate_limited=None,
+    batch_tag: str = "",
+) -> dict:
+    max_retries = max_retries if max_retries is not None else SCREEN_MAX_RETRIES
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return call_screen_batch(papers, client=client, on_rate_limited=on_rate_limited)
+        except (LLMBatchError, ScreenParseError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                wait = min(60.0, 2 ** (attempt - 1))
+                log.warning(
+                    "[batch %s] Screen batch retry attempt=%s/%s size=%s err=%s",
+                    batch_tag, attempt, max_retries, len(papers), exc,
+                )
+                time.sleep(wait)
+                continue
+    raise last_exc
+
+
+@dataclass
+class ScreenRunStats:
+    requested: int = 0
+    completed: int = 0
+    failed: int = 0
+    skipped_existing: int = 0
+    rounding_warnings: int = 0
+    batches: int = 0
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "requested": self.requested,
+            "completed": self.completed,
+            "failed": self.failed,
+            "skipped_existing": self.skipped_existing,
+            "rounding_warnings": self.rounding_warnings,
+            "batches": self.batches,
+            "calls": self.calls,
+            "batch_size": SCREEN_BATCH_SIZE,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "estimated_total_cost_usd": round(self.estimated_cost_usd, 6),
+            "model": resolve_screen_model(),
+            "provider": LLM_PROVIDER,
+            "prompt_version": SCREEN_PROMPT_VERSION,
+            "reasoning": "disabled",
+        }
+
+
+def screen_assessment_exists(conn, content_id: int) -> bool:
+    model = resolve_screen_model()
+    row = conn.execute(
+        """
+        SELECT 1 AS ok
+        FROM research_radar.content_score_assessments
+        WHERE content_id = %s
+          AND provider = %s
+          AND model_name = %s
+          AND prompt_version = %s
+          AND status = 'COMPLETED'
+        LIMIT 1
+        """,
+        (content_id, LLM_PROVIDER, model, SCREEN_PROMPT_VERSION),
+    ).fetchone()
+    return bool(row)
+
+
+def upsert_screen_assessment(
+    conn,
+    *,
+    content_id: int,
+    batch_id,
+    batch_size: int,
+    batch_position: int,
+    result: dict,
+):
+    """Only the four screen dimensions + status/tokens/cost. No prose fields,
+    no sample_group (screen isn't sampled — every eligible paper is screened)."""
+    sql = """
+        INSERT INTO research_radar.content_score_assessments(
+            content_id, assessment_type, provider, model_name, prompt_version,
+            scoring_tier,
+            ai_relevance, technical_significance, apparent_novelty, evidence_strength,
+            batch_id, batch_size, batch_position,
+            reasons, industry_labels,
+            input_tokens, output_tokens, estimated_cost_usd,
+            response_id, status, error_message
+        ) VALUES (
+            %s, %s, %s, %s, %s,
+            %s,
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s::jsonb, %s::jsonb,
+            %s, %s, %s,
+            %s, %s, %s
+        )
+        ON CONFLICT (content_id, provider, model_name, prompt_version) DO UPDATE SET
+            scoring_tier = EXCLUDED.scoring_tier,
+            ai_relevance = EXCLUDED.ai_relevance,
+            technical_significance = EXCLUDED.technical_significance,
+            apparent_novelty = EXCLUDED.apparent_novelty,
+            evidence_strength = EXCLUDED.evidence_strength,
+            batch_id = EXCLUDED.batch_id,
+            batch_size = EXCLUDED.batch_size,
+            batch_position = EXCLUDED.batch_position,
+            input_tokens = EXCLUDED.input_tokens,
+            output_tokens = EXCLUDED.output_tokens,
+            estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+            response_id = EXCLUDED.response_id,
+            status = EXCLUDED.status,
+            error_message = EXCLUDED.error_message,
+            created_at = NOW()
+    """
+    params = (
+        content_id,
+        ASSESSMENT_TYPE,
+        LLM_PROVIDER,
+        resolve_screen_model(),
+        SCREEN_PROMPT_VERSION,
+        "screen",
+        result.get("ai_relevance"),
+        result.get("technical_significance"),
+        result.get("apparent_novelty"),
+        result.get("evidence_strength"),
+        batch_id,
+        batch_size,
+        batch_position,
+        json.dumps({}),
+        json.dumps([]),
+        result.get("input_tokens"),
+        result.get("output_tokens"),
+        result.get("estimated_cost_usd"),
+        result.get("response_id"),
+        result.get("status") or "COMPLETED",
+        result.get("error_message"),
+    )
+    conn.execute(sql, params)
+
+
+def estimate_screen_prompt_tokens(papers: list[dict]) -> int:
+    prompt = SCREEN_SYSTEM_PROMPT + build_screen_batch_user_prompt(papers)
+    return max(1, len(prompt) // 4)
+
+
+def stage_screen(
+    conn,
+    run_id,
+    *,
+    limit: int | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+    client=None,
+):
+    """
+    Pass 1 — screen. Batch 15, randomly composed. Every ENTITY_RESOLVED/
+    SCORED/CANDIDATE paper is screened (no sampling — the gate, not a sample,
+    decides who reaches pass 2).
+    """
+    if not dry_run:
+        require_scoring_enabled()
+        require_api_key()
+
+    candidates = load_quality_candidates(conn, limit=limit)
+    if not force:
+        candidates = [c for c in candidates if not screen_assessment_exists(conn, c["content_id"])]
+
+    stats = ScreenRunStats(requested=len(candidates))
+    batches = random_batches(candidates, SCREEN_BATCH_SIZE)
+    stats.batches = len(batches)
+
+    if dry_run:
+        est_in = sum(estimate_screen_prompt_tokens(b) for b in batches)
+        est_out = 40 * len(candidates)  # four bare numbers, no prose
+        stats.input_tokens = est_in
+        stats.output_tokens = est_out
+        stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
+        stats.calls = len(batches)
+        summary = stats.to_dict()
+        conn.execute(
+            "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
+            (json.dumps({"screen_dry_run": summary}), run_id),
+        )
+        log.info("Screen DRY RUN: %s", json.dumps(summary))
+        print("\nSCREEN (PASS 1) DRY RUN")
+        for k, v in summary.items():
+            print(f"  {k}: {v}")
+        print(cost_summary_line("Pass 1:", stats.requested, stats.calls, stats.estimated_cost_usd))
+        return stats
+
+    if client is None:
+        client = create_llm_client()
+
+    gate = AdaptiveConcurrencyGate(SCORING_CONCURRENCY)
+
+    def _process_batch(batch: list[dict]) -> list[tuple[str, dict]]:
+        from research_radar.pipeline import bump, connect as _connect, event
+
+        batch_id = uuid.uuid4()
+        batch_tag = str(batch_id)[:8]
+        batch_size = len(batch)
+        positioned = {int(p["content_id"]): (i + 1, p) for i, p in enumerate(batch)}
+        outcomes: list[tuple[str, dict]] = []
+
+        gate.acquire()
+        try:
+            try:
+                result = call_screen_batch_with_retry(
+                    batch, client=client, on_rate_limited=gate.report_rate_limited, batch_tag=batch_tag
+                )
+                stats.calls += 1
+            except (LLMBatchError, ScreenParseError) as exc:
+                log.warning("[batch %s] Screen batch failed entirely; falling back to individual calls: %s", batch_tag, exc)
+                result = None
+
+            parsed: dict[int, dict] = {}
+            rounding_warnings = 0
+            if result is not None:
+                parsed = result["results"]
+                rounding_warnings = result["rounding_warnings"]
+                stats.input_tokens += int(result["input_tokens"] or 0)
+                stats.output_tokens += int(result["output_tokens"] or 0)
+                stats.estimated_cost_usd += float(result["estimated_cost_usd"] or 0)
+
+            missing_ids = set(positioned.keys()) - set(parsed.keys())
+            for pid in missing_ids:
+                pos, paper = positioned[pid]
+                try:
+                    single = call_screen_batch_with_retry(
+                        [paper], client=client, on_rate_limited=gate.report_rate_limited, batch_tag=batch_tag
+                    )
+                    stats.calls += 1
+                    r = single["results"].get(pid)
+                    if r is None:
+                        raise ScreenParseError(f"paper {pid} missing from individual retry response too")
+                    stats.input_tokens += int(single["input_tokens"] or 0)
+                    stats.output_tokens += int(single["output_tokens"] or 0)
+                    stats.estimated_cost_usd += float(single["estimated_cost_usd"] or 0)
+                    rounding_warnings += single["rounding_warnings"]
+                    with _connect() as wconn:
+                        upsert_screen_assessment(
+                            wconn, content_id=pid, batch_id=batch_id, batch_size=batch_size, batch_position=pos,
+                            result={**r, "input_tokens": single["input_tokens"], "output_tokens": single["output_tokens"],
+                                    "estimated_cost_usd": single["estimated_cost_usd"], "response_id": single["response_id"],
+                                    "status": "COMPLETED"},
+                        )
+                        event(wconn, run_id, pid, "screen", "completed", True,
+                              {"individual_retry": True, "ai_relevance": r.get("ai_relevance"), "batch": batch_tag})
+                        wconn.commit()
+                    outcomes.append(("completed", {"content_id": pid}))
+                except Exception as exc:
+                    with _connect() as wconn:
+                        upsert_screen_assessment(
+                            wconn, content_id=pid, batch_id=batch_id, batch_size=batch_size, batch_position=pos,
+                            result={"status": "ERROR", "error_message": str(exc)[:1000]},
+                        )
+                        event(wconn, run_id, pid, "screen", "error", False, {"batch": batch_tag}, str(exc))
+                        bump(wconn, run_id, "errors")
+                        wconn.commit()
+                    outcomes.append(("failed", {"content_id": pid, "error": str(exc)}))
+
+            if parsed:
+                with _connect() as wconn:
+                    for pid, r in parsed.items():
+                        pos, _paper = positioned[pid]
+                        upsert_screen_assessment(
+                            wconn, content_id=pid, batch_id=batch_id, batch_size=batch_size, batch_position=pos,
+                            result={**r, "status": "COMPLETED", "response_id": result.get("response_id") if result else None},
+                        )
+                        event(wconn, run_id, pid, "screen", "completed", True,
+                              {"ai_relevance": r.get("ai_relevance"), "batch_size": batch_size, "batch": batch_tag})
+                    wconn.commit()
+                for pid in parsed:
+                    outcomes.append(("completed", {"content_id": pid}))
+
+            stats.rounding_warnings += rounding_warnings
+            return outcomes
+        finally:
+            gate.release()
+
+    workers = max(1, SCORING_CONCURRENCY)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_process_batch, b) for b in batches]
+        done_batches = 0
+        for fut in as_completed(futures):
+            for kind, _payload in fut.result():
+                if kind == "completed":
+                    stats.completed += 1
+                else:
+                    stats.failed += 1
+            done_batches += 1
+            log.info("Screen (pass 1) batches progress %d/%d concurrency_ceiling=%d", done_batches, len(batches), gate.ceiling)
+
+    summary = stats.to_dict()
+    conn.execute(
+        "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
+        (json.dumps({"screen_stats": summary}), run_id),
+    )
+    log.info("Screen stats: %s", json.dumps(summary))
+    print("\nSCREEN (PASS 1) SUMMARY")
+    for k, v in summary.items():
+        print(f"  {k}: {v}")
+    print(cost_summary_line("Pass 1:", stats.completed, stats.calls, stats.estimated_cost_usd))
+    return stats
+
+
+def count_scoring_pool(conn) -> dict:
+    """How many papers were screened vs fully scored — for `report`'s pool line."""
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE scoring_tier = 'screen') AS screened,
+            COUNT(*) FILTER (WHERE scoring_tier = 'full') AS full_scored
+        FROM research_radar.content_score_assessments
+        WHERE status = 'COMPLETED'
+          AND prompt_version IN (%s, %s)
+        """,
+        (SCREEN_PROMPT_VERSION, QUALITY_PROMPT_VERSION),
+    ).fetchone()
+    return {"screened": int(row["screened"] or 0), "full": int(row["full_scored"] or 0)}
+
+
+def project_full_run_costs(conn, *, gate_percentile: float | None = None, sample_size: int = 50) -> dict:
+    """
+    Zero-API-call cost projection for a full scoring run over the currently
+    eligible (not-yet-screened) pool: pass 1 over all of it, pass 2 + independence
+    over the gated top `gate_percentile` percent. Token estimates are extrapolated
+    from a small real sample's actual title/categories/abstract lengths, not a
+    synthetic paper, so the projection reflects the real corpus.
+    """
+    from research_radar.independence import SYSTEM_PROMPT as INDEPENDENCE_SYSTEM_PROMPT
+
+    gate_percentile = GATE_PERCENTILE if gate_percentile is None else gate_percentile
+
+    all_eligible = load_quality_candidates(conn)
+    already_screened = {
+        r["content_id"]
+        for r in conn.execute(
+            "SELECT content_id FROM research_radar.content_score_assessments "
+            "WHERE prompt_version = %s AND scoring_tier = 'screen' AND status = 'COMPLETED'",
+            (SCREEN_PROMPT_VERSION,),
+        ).fetchall()
+    }
+    pass1_pool = [c for c in all_eligible if c["content_id"] not in already_screened]
+
+    sample = pass1_pool[: max(1, sample_size)] if pass1_pool else all_eligible[: max(1, sample_size)]
+    if not sample:
+        zero = {"n": 0, "calls": 0, "cost": 0.0}
+        return {"pass1": zero, "pass2": dict(zero), "independence": dict(zero)}
+
+    sample_batches_p1 = random_batches(sample, SCREEN_BATCH_SIZE)
+    avg_in_p1 = sum(estimate_screen_prompt_tokens(b) for b in sample_batches_p1) / len(sample)
+    avg_out_p1 = 40  # four bare numbers, no prose
+
+    sample_batches_p2 = random_batches(sample, QUALITY_BATCH_SIZE)
+    avg_in_p2 = sum(estimate_quality_prompt_tokens(b) for b in sample_batches_p2) / len(sample)
+    avg_out_p2 = 220  # structured JSON incl. so_what/reason_not_higher
+
+    avg_in_ind = (len(INDEPENDENCE_SYSTEM_PROMPT) // 4) / 20 + 140  # amortised system + per-paper body, batch 20
+    avg_out_ind = 30  # status + short reason
+
+    n_pass1 = len(pass1_pool)
+    n_pass2 = math.ceil(n_pass1 * gate_percentile / 100.0)
+    n_independence = n_pass2  # independence runs only on pass-2 papers (brief §1)
+
+    def calls_for(n, batch_size):
+        return math.ceil(n / batch_size) if n else 0
+
+    pass1 = {
+        "n": n_pass1,
+        "calls": calls_for(n_pass1, SCREEN_BATCH_SIZE),
+        "cost": estimate_cost_usd(int(avg_in_p1 * n_pass1), int(avg_out_p1 * n_pass1)),
+    }
+    pass2 = {
+        "n": n_pass2,
+        "calls": calls_for(n_pass2, QUALITY_BATCH_SIZE),
+        "cost": estimate_cost_usd(int(avg_in_p2 * n_pass2), int(avg_out_p2 * n_pass2)),
+    }
+    independence = {
+        "n": n_independence,
+        "calls": calls_for(n_independence, 20),
+        "cost": estimate_cost_usd(int(avg_in_ind * n_independence), int(avg_out_ind * n_independence)),
+    }
+    return {"pass1": pass1, "pass2": pass2, "independence": independence}

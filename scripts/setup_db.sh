@@ -13,4 +13,5 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/006_content_score_assessments.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/007_affiliation_gpt.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/008_affiliation_historical_status_fix.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/009_content_final_scores.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/010_scoring_v2.sql
 echo "research_radar schema + watchlists installed."

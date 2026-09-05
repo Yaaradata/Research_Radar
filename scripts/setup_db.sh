@@ -17,4 +17,5 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/010_scoring_v2.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/011_backfill_checkpoints.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/012_topic_hierarchy.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/013_seed_topic_hierarchy.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/014_scoring_v3.sql
 echo "research_radar schema + watchlists installed."

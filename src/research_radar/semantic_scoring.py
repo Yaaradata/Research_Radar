@@ -1625,14 +1625,17 @@ def load_quality_candidates(conn, limit: int | None = None) -> list[dict]:
 # Code gate: screen rows with ai_relevance <= 3 never reach pass 2 (prompt no longer
 # collapses other dimensions when ai_relevance is low).
 SCREEN_AI_RELEVANCE_FLOOR = 3.0
+# ai_relevance gates only; ranking mean matches radar-v2 quality mean (excludes ai_relevance).
+SCREEN_RANKING_FIELDS = ["technical_significance", "apparent_novelty", "evidence_strength"]
 
 
 def select_gated_content_ids(conn, *, gate_percentile: float | None = None) -> list[int]:
     """
-    Rank COMPLETED screen assessments by the mean of the four screen
-    dimensions, drop ai_relevance <= 3 outright, and return the content_ids in
-    the top `gate_percentile` percent. Pure Python ranking over a DB read —
-    same style as final_score.py's org/person boosts. Makes no API calls.
+    Rank COMPLETED screen assessments by the mean of technical_significance,
+    apparent_novelty and evidence_strength. Drop ai_relevance <= 3 outright, and
+    return the content_ids in the top `gate_percentile` percent. Pure Python
+    ranking over a DB read — same style as final_score.py's org/person boosts.
+    Makes no API calls.
     """
     gate_percentile = GATE_PERCENTILE if gate_percentile is None else gate_percentile
     rows = conn.execute(
@@ -1649,7 +1652,7 @@ def select_gated_content_ids(conn, *, gate_percentile: float | None = None) -> l
         ai_rel = r.get("ai_relevance")
         if ai_rel is None or float(ai_rel) <= SCREEN_AI_RELEVANCE_FLOOR:
             continue
-        dims = [r.get("ai_relevance"), r.get("technical_significance"), r.get("apparent_novelty"), r.get("evidence_strength")]
+        dims = [r.get(k) for k in SCREEN_RANKING_FIELDS]
         if any(d is None for d in dims):
             continue
         mean = sum(float(d) for d in dims) / len(dims)

@@ -2055,7 +2055,7 @@ def print_top_candidates(top=10):
             )
 
 
-PAID_STAGES = frozenset({"affiliation-gpt", "screen", "independence", "semantic-score", "topics"})
+PAID_STAGES = frozenset({"affiliation-gpt", "classify", "screen", "independence", "semantic-score", "topics"})
 
 
 class PaidStageNotAuthorised(RuntimeError):
@@ -2120,6 +2120,16 @@ def run_stage(
                 # Deterministic scoring — kept unwired from `all` (brief §7). The
                 # function stays available for manual/legacy use via --stage score.
                 stage_score(conn, run_id, limit=limit)
+            elif stage == "classify":
+                from research_radar.classify import stage_classify
+
+                stage_classify(
+                    conn,
+                    run_id,
+                    limit=limit,
+                    dry_run=dry_run,
+                    force=force,
+                )
             elif stage == "screen":
                 from research_radar.semantic_scoring import stage_screen
 
@@ -2279,6 +2289,7 @@ def main():
             "openalex",
             "openalex-retry",
             "affiliation-gpt",
+            "classify",
             "score",
             "screen",
             "semantic-score",

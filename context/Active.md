@@ -2,35 +2,28 @@
 
 ## Current focus
 
-Cursor agent definitions installed under `.cursor/agents/` and `.cursor/rules/`.
-Beginning Scoring v3 changes (uploaded brief).
+Scoring v3 implementation complete on branch `cursor/scoring-v3-all-bbc7`.
 
-## Branch
+## Changes shipped (code)
 
-TBD — create `cursor/scoring-v3-*-bbc7` per change.
-
-## Agent layout
-
-```text
-.cursor/agents/engineer.md   — implementation
-.cursor/agents/scout.md      — read-only facts
-.cursor/agents/verifier.md   — artifact validation
-.cursor/rules/architect.mdc  — parent orchestration
-.cursor/rules/research-radar.mdc — project traps and stage order
-```
-
-## Scoring v3 queue (one change at a time)
-
-1. ~~Remove gate-collapse instruction from screen + quality prompts~~ **DONE** (`cursor/scoring-v3-gate-prompt-bbc7`, verifier PASS)
-2. **NEXT:** Drop `ai_relevance` from screen ranking mean in `select_gated_content_ids()`
-3. Independence prompt emits `paper_kind`
-4. Migration `content_classifications` + new `classify` stage
+| # | Change | Status |
+|---|---|---|
+| 1 | New `classify` stage + `content_classifications` table | **DONE** (migration `sql/014_scoring_v3.sql` unapplied) |
+| 2 | Remove gate-collapse from screen + quality prompts | **DONE** (v3 prompt versions) |
+| 3 | Drop `ai_relevance` from screen ranking mean | **DONE** |
+| 4 | Independence emits `paper_kind` (`independence-v2`) | **DONE** |
 
 ## Blockers
 
-None for prompt/ranking changes (no DDL). Classify pass blocked on migration apply by human.
+- Human must apply `sql/014_scoring_v3.sql` before running `classify` or independence v2 writes.
+- Paid stages require `--allow-paid` and `OPENROUTER_API_KEY`.
 
 ## Verified
 
-- Repo structure: `src/research_radar/`, `sql/001`–`013`, tests present
-- Gate-collapse text at `semantic_scoring.py` lines ~1176–1178 (quality) and screen prompt
+- `python -m pytest tests/test_scoring_v2.py tests/test_classify.py -q` → 33 passed
+
+## Next
+
+1. Apply migration 014
+2. `./scripts/run_stage.sh classify --dry-run --allow-paid` then live classify on a limit
+3. Re-screen with v3 prompts if stored v2 screen scores need refresh

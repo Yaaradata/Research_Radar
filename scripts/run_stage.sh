@@ -51,13 +51,14 @@ Stages (run in this order):
   4c) repair-timestamps   Fix published_at/source_seen_at from stored raw_metadata (no Inoreader)
   5) affiliation-gpt   GPT evidence-only affiliation resolver (PAID — needs --allow-paid)
   5b) openalex   DEPRECATED legacy Crossref/OpenAlex (inactive unless explicitly enabled)
-  6) score       Deterministic component scores + opportunities (SCORED / CANDIDATE)
-                 NOTE: `all` ends here. All paid stages are separate and explicit.
-  7) semantic-score   GPT assessment-only experiment (PAID — needs --allow-paid)
-  8) semantic-compare Compare deterministic vs GPT semantic ranks (explicit)
-  9) final-score      Recompute ranking from stored assessments + org/person boosts (FREE)
- 10) report           Markdown Top N from content_final_scores (FREE)
- 11) show             Print top candidates (deterministic CANDIDATE pool)
+  6) classify    Scoring v3 — domain/audience/paper_kind on full eligible pool (PAID — needs --allow-paid)
+  7) screen      Scoring v2 pass 1 — cheap screen gate (PAID — needs --allow-paid)
+  8) semantic-score   GPT full rubric pass 2 (PAID — needs --allow-paid)
+  9) independence     Categorical independence + paper_kind (PAID — needs --allow-paid)
+ 10) semantic-compare Compare deterministic vs GPT semantic ranks (explicit)
+ 11) final-score      Recompute ranking from stored assessments + org/person boosts (FREE)
+ 12) report           Markdown Top N from content_final_scores (FREE)
+ 13) show             Print top candidates (deterministic CANDIDATE pool)
  12) arxiv-backfill   arXiv OAI-PMH metadata backfill (FREE, explicit, not in `all`)
                  --from/--until (ISO dates) required. --dry-run projects volume with
                  zero writes. --force re-harvests COMPLETE checkpoint windows.

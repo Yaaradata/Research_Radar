@@ -25,10 +25,11 @@ This package implements the MVP architecture from the supplied project brief usi
 Run in this order:
 
 ```text
-ingest → relevance → enrich → entities → screen → semantic-score → independence → final-score
+ingest → relevance → enrich → entities → classify → screen → semantic-score → independence → final-score
 
 `all` (free, cron path) runs only: ingest → relevance → enrich → entities
 Paid stages, run explicitly and never on cron:
+  classify        --allow-paid   (scoring v3 — domain/audience/paper_kind on full eligible pool)
   affiliation-gpt --allow-paid
   screen          --allow-paid   (pass 1 — cheap, non-reasoning, gates who reaches pass 2)
   semantic-score  --allow-paid   (pass 2 — full rubric, gated subset only)
@@ -42,6 +43,7 @@ Paid stages, run explicitly and never on cron:
 | `enrich` | arXiv Atom + HTML (metadata, emails, affiliations) |
 | `entities` | Local org/people resolution from paper evidence |
 | `affiliation-gpt` | Evidence-only GPT affiliation resolver. **Paid** — requires `--allow-paid`. GPT is the resolver, never the evidence source: organisation names must ground back to original paper/email evidence, and watchlist matching is deterministic. |
+| `classify` | Scoring v3 — `research-classify-v1`, Haiku-tier, batched 15, title/abstract/categories only. Runs on **every** eligible paper before the gate. **Paid** — requires `--allow-paid`. |
 | `screen` | Scoring v2 pass 1 — cheap, non-reasoning `SCREEN_MODEL`, batched 15, 4 dimensions, no prose. Every eligible paper is screened. **Paid** — requires `--allow-paid`. |
 | `semantic-score` | Scoring v2 pass 2 — full rubric, batched 5 randomly, title/abstract/categories **only** (never affiliation), on ONLY the top `GATE_PERCENTILE`% of screen scores (`ai_relevance <= 3` excluded outright). **Paid** — requires `--allow-paid`. Assessment-only; does not change `status`. |
 | `independence` | Scoring v2 Call B — categorical independence classification, batched 20, title+abstract+affiliation_text, runs ONLY on pass-2 (`scoring_tier='full'`) papers. **Paid** — requires `--allow-paid`. |

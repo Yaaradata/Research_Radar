@@ -30,6 +30,7 @@ from research_radar.llm_batch import (
     random_batches,
     strip_json_fences,
 )
+from research_radar.classification_vocab import PAPER_KINDS
 from research_radar.semantic_scoring import (
     OPENROUTER_API_KEY,
     QUALITY_PROMPT_VERSION,
@@ -47,7 +48,7 @@ INDEPENDENCE_MODEL = (os.getenv("INDEPENDENCE_MODEL", "openai/gpt-5.6-sol").stri
 # Independence is a short categorical task; reasoning is cheap here (brief §2).
 INDEPENDENCE_REASONING_EFFORT = os.getenv("INDEPENDENCE_REASONING_EFFORT", "low").strip() or "low"
 INDEPENDENCE_PROMPT_VERSION = (
-    os.getenv("INDEPENDENCE_PROMPT_VERSION", "independence-v1").strip() or "independence-v1"
+    os.getenv("INDEPENDENCE_PROMPT_VERSION", "independence-v2").strip() or "independence-v2"
 )
 INDEPENDENCE_BATCH_SIZE = int(os.getenv("INDEPENDENCE_BATCH_SIZE", "20"))
 INDEPENDENCE_MAX_RETRIES = int(os.getenv("INDEPENDENCE_MAX_RETRIES", "3"))
@@ -102,10 +103,18 @@ self_evaluation for claims about a pre-existing organisational product.
 Give one short reason per paper citing what in the supplied text led to the
 decision.
 
+Also emit paper_kind — one value describing what kind of contribution this is:
+
+method · empirical_study · benchmark_dataset · survey_review · theory · position ·
+negative_result · system_infrastructure
+
+Theory papers, surveys, datasets and negative results are often not_applicable for
+independence; still emit the paper_kind you infer from the abstract.
+
 Return ONLY a JSON object with a single key "papers", whose value is an array
 with one object per paper, in the order supplied. No prose, no markdown
 fences.
-{"papers": [{"paper_id": <int>, "status": "...", "reason": "..."}]}
+{"papers": [{"paper_id": <int>, "status": "...", "reason": "...", "paper_kind": "..."}]}
 """
 
 INDEPENDENCE_ITEM_SCHEMA = {
@@ -115,8 +124,9 @@ INDEPENDENCE_ITEM_SCHEMA = {
         "paper_id": {"type": "integer"},
         "status": {"type": "string", "enum": list(INDEPENDENCE_STATUSES)},
         "reason": {"type": "string"},
+        "paper_kind": {"type": "string", "enum": list(PAPER_KINDS)},
     },
-    "required": ["paper_id", "status", "reason"],
+    "required": ["paper_id", "status", "reason", "paper_kind"],
 }
 
 INDEPENDENCE_RESPONSE_SCHEMA = {
@@ -191,8 +201,11 @@ def parse_independence_batch(text: str, expected_ids: set[int]) -> dict[int, dic
         reason = (item.get("reason") or "").strip()
         if not reason:
             raise IndependenceParseError(f"empty reason for paper {pid}")
+        paper_kind = (item.get("paper_kind") or "").strip()
+        if paper_kind not in PAPER_KINDS:
+            raise IndependenceParseError(f"invalid paper_kind for paper {pid}: {paper_kind!r}")
         if pid in expected_ids:
-            out[pid] = {"status": status, "reason": reason}
+            out[pid] = {"status": status, "reason": reason, "paper_kind": paper_kind}
     return out
 
 
@@ -321,6 +334,7 @@ def upsert_independence_assessment(
     content_id: int,
     status: str,
     reason: str | None,
+    paper_kind: str | None,
     evidence_used: str | None,
     input_tokens: int | None,
     output_tokens: int | None,
@@ -331,12 +345,13 @@ def upsert_independence_assessment(
         """
         INSERT INTO research_radar.content_independence_assessments(
             content_id, provider, model_name, prompt_version,
-            status, reason, evidence_used,
+            status, reason, paper_kind, evidence_used,
             tokens_in, tokens_out, cost_usd, response_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (content_id, provider, model_name, prompt_version) DO UPDATE SET
             status = EXCLUDED.status,
             reason = EXCLUDED.reason,
+            paper_kind = EXCLUDED.paper_kind,
             evidence_used = EXCLUDED.evidence_used,
             tokens_in = EXCLUDED.tokens_in,
             tokens_out = EXCLUDED.tokens_out,
@@ -351,6 +366,7 @@ def upsert_independence_assessment(
             INDEPENDENCE_PROMPT_VERSION,
             status,
             reason,
+            paper_kind,
             evidence_used,
             input_tokens,
             output_tokens,
@@ -488,6 +504,7 @@ def stage_independence(
                             content_id=pid,
                             status=r["status"],
                             reason=r["reason"],
+                            paper_kind=r.get("paper_kind"),
                             evidence_used=paper.get("affiliation_text") and json.dumps(paper.get("affiliation_text"), default=str),
                             input_tokens=single["input_tokens"],
                             output_tokens=single["output_tokens"],
@@ -504,6 +521,7 @@ def stage_independence(
                             content_id=pid,
                             status="ERROR",
                             reason=str(exc)[:1000],
+                            paper_kind=None,
                             evidence_used=None,
                             input_tokens=None,
                             output_tokens=None,
@@ -524,6 +542,7 @@ def stage_independence(
                             content_id=pid,
                             status=r["status"],
                             reason=r["reason"],
+                            paper_kind=r.get("paper_kind"),
                             evidence_used=paper.get("affiliation_text") and json.dumps(paper.get("affiliation_text"), default=str),
                             input_tokens=None,
                             output_tokens=None,

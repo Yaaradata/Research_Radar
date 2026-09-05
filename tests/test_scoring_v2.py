@@ -321,6 +321,19 @@ def test_screen_ai_relevance_le_3_never_reaches_pass2():
     assert set(gated) == {1, 3}
 
 
+def test_screen_ranking_excludes_ai_relevance_from_mean():
+    """High ai_relevance must not outrank stronger technical/novelty/evidence scores."""
+    rows = [
+        _screen_row(1, ai_relevance=10.0, mean_other=4.0),
+        _screen_row(2, ai_relevance=5.0, mean_other=9.0),
+    ]
+    conn = MagicMock()
+    conn.execute.return_value = _FakeCursorResult(rows)
+
+    gated = ss.select_gated_content_ids(conn, gate_percentile=50)
+    assert gated == [2]
+
+
 # ---------------------------------------------------------------------------
 # GATE_PERCENTILE is env-configurable, never hardcoded.
 # ---------------------------------------------------------------------------
@@ -406,6 +419,24 @@ def test_self_evaluation_narrowness_documented_in_system_prompt():
     assert "not_applicable, not self_evaluation" in prompt
     assert "Almost all research does this" in prompt
     assert "Only use\nself_evaluation for claims about a pre-existing organisational product." in prompt
+    assert "paper_kind" in prompt
+
+
+def test_independence_parse_includes_paper_kind():
+    text = json.dumps(
+        {
+            "papers": [
+                {
+                    "paper_id": 42,
+                    "status": "not_applicable",
+                    "reason": "Introduces a new method evaluated on standard benchmarks.",
+                    "paper_kind": "method",
+                }
+            ]
+        }
+    )
+    out = ind.parse_independence_batch(text, {42})
+    assert out[42]["paper_kind"] == "method"
 
 
 # ---------------------------------------------------------------------------

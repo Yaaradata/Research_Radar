@@ -101,10 +101,20 @@ topics      THREE to EIGHT specific free-text tags describing what the paper
             specificity: "synthetic text detection", "chain of thought
             prompting", "speculative decoding", "reward hacking".
 
-applications ZERO to FOUR, chosen from the APPLICATIONS list below. Only
-            include an application the paper explicitly addresses or
-            evaluates. An abstract that never mentions education must not be
-            tagged education.
+application_domains ZERO to FOUR, chosen from the APPLICATIONS list below.
+            When no sector is explicitly addressed, return ["general-method"]
+            alone — never an empty list. Only include a sector the paper
+            explicitly addresses or evaluates.
+
+general-method    The paper presents a method, model or theoretical result
+                  with no specific application domain. Most methods papers
+                  are this. Choosing general-method is a correct, expected
+                  answer - do NOT reach for a sector when none is addressed.
+                  If you find yourself constructing an argument for why a
+                  method "could apply" to a domain, the answer is
+                  general-method.
+
+general-method is mutually exclusive with every other application domain.
 
 EXTRACTING KEY CLAIMS
 
@@ -236,11 +246,14 @@ def parse_topics_batch(text: str, expected_ids: set[int]) -> dict[int, dict]:
         if pid not in expected_ids:
             continue
         claims = item.get("claims")
+        applications = [str(a).strip() for a in (item.get("applications") or item.get("application_domains") or []) if str(a).strip()]
+        if "general-method" in applications and len(applications) > 1:
+            raise TopicsParseError(f"paper {pid} general-method must not combine with other applications")
         out[pid] = {
             "domain": str(item.get("domain") or "").strip(),
             "subdomains": [str(s).strip() for s in (item.get("subdomains") or []) if str(s).strip()],
             "topics": [str(t).strip() for t in (item.get("topics") or []) if str(t).strip()],
-            "applications": [str(a).strip() for a in (item.get("applications") or []) if str(a).strip()],
+            "applications": applications,
             "claims": claims if isinstance(claims, list) else [],
         }
     return out

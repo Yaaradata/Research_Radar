@@ -65,16 +65,24 @@ APPLICATION DOMAIN
 
 Which real-world sector could deploy this, if the paper names or clearly implies one?
 
+general_method    The paper presents a method, model or theoretical result
+                  with no specific application domain. Most methods papers
+                  are this. Choosing general_method is a correct, expected
+                  answer - do NOT reach for a sector when none is addressed.
+                  If you find yourself constructing an argument for why a
+                  method "could apply" to a domain, the answer is
+                  general_method.
+
 MOST AI PAPERS HAVE NO APPLICATION DOMAIN. A new attention mechanism, a training
-efficiency result, or a general reasoning benchmark is general_method. This is the
-correct and most common answer. Do not force-fit a sector.
+efficiency result, or a general reasoning benchmark is general_method.
 
 Assign a sector ONLY when the paper states or unmistakably implies it - a named clinical
 dataset, a named financial task, a named industrial process. "Could be useful in
 healthcare" is not enough. If you are reaching for a justification, the answer is
 general_method.
 
-Return 1 to 3 values. If any real sector applies, do not also return general_method.
+Return 1 to 3 values. general_method is mutually exclusive with every other domain.
+If any real sector applies, do not also return general_method.
 
 AUDIENCE RELEVANCE
 

@@ -1,0 +1,32 @@
+# Classification / screening bake-off candidates.
+# reasoning: disabled — classification is pattern recognition, not deliberation.
+
+candidates:
+  - id: haiku
+    model: anthropic/claude-haiku-4.5
+    reasoning: disabled
+    input_cost_per_million: 1.00
+    output_cost_per_million: 5.00
+
+  - id: glm-flash
+    model: z-ai/glm-5.3-flash
+    reasoning: disabled
+    input_cost_per_million: 0.10
+    output_cost_per_million: 0.40
+
+  - id: gpt-4o-mini
+    model: openai/gpt-4o-mini
+    reasoning: disabled
+    input_cost_per_million: 0.15
+    output_cost_per_million: 0.60
+
+  - id: gemini-flash
+    model: google/gemini-3.8-flash
+    reasoning: disabled
+    input_cost_per_million: 0.10
+    output_cost_per_million: 0.40
+
+# Batch sizes for the bake-off run (not tuned per model).
+batch_size: 10
+sample_size: 400
+sample_seed: 20260905

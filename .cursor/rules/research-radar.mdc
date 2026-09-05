@@ -17,12 +17,14 @@ Code lives in `src/research_radar/`. Migrations in `sql/` (numbered, apply in or
 ## Stage order (load-bearing)
 
 ```text
-ingest → relevance → enrich → entities → [affiliation-gpt] → screen → semantic-score → independence → final-score
+ingest → relevance → enrich → entities → [affiliation-gpt] → classify → screen → semantic-score → independence → final-score
 ```
+
+Parallel annotation (not in `all`): `arxiv-backfill`, `topics`, `corpus-search`.
 
 `all` (cron path) runs only: ingest → relevance → enrich → entities — never paid stages.
 
-**Paid stages** (`PAID_STAGES` in `pipeline.py`): `affiliation-gpt`, `screen`,
+**Paid stages** (`PAID_STAGES` in `pipeline.py`): `affiliation-gpt`, `classify`, `screen`,
 `semantic-score`, `independence`, `topics`. Each requires `--allow-paid` on the CLI.
 Run `scoring-cost` first (free) to see projected spend.
 
@@ -125,8 +127,30 @@ Verifier recounts from DB or file — never stdout.
 7. **Two independently derived enums for the same field fail silently on join.** Vocabulary
    for `classify` is provisional until aligned with the main pipeline derivation backlog.
 
+## Classification bake-off
+
+- `config/bakeoff_models.yaml` defines candidates — never hardcode models in scripts.
+- Classification/screening candidates run with **reasoning disabled**. Quality pass requires reasoning.
+- Bake-off winner is decided by **accuracy against human labels**, subject to structured-output and batch-stability gates — not cost or leaderboard rank.
+- Human labelling exports must **not** show model outputs on labelling sheets (see `bakeoff_export_labels.py`).
+- Migrations `015` (general-method application) and `016` (bakeoff tables) are unapplied until human runs `setup_db.sh`.
+- Agents do **not** run the bake-off or paid stages without explicit `--allow-paid`.
+
+## Quality scorer constraints
+
+- The quality scorer never sees affiliations, authors or organisations.
+- Claims and organisation names must ground to literal source text.
+
+## Prompt versioning
+
+- Prompts are versioned (`CLASSIFY_PROMPT_VERSION`, `BAKEOFF_PROMPT_VERSION`, etc.).
+- The same version string may never carry different content.
+
+## Stage selection rule
+
+- Any new stage selects a **status set**, never a single status (this has caused two bugs).
+
 ## Active work
 
-Scoring v3 (see uploaded brief): (1) new `classify` pass + `content_classifications` table,
-(2) remove gate-collapse from prompts, (3) drop `ai_relevance` from screen ranking mean,
-(4) independence emits `paper_kind`. Implement one change at a time.
+Classification model bake-off harness: `scripts/bakeoff_*.py`, `sql/016_bakeoff.sql`.
+Human applies migrations 015–016 before running sample/import.

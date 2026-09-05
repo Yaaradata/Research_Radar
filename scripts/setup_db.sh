@@ -18,4 +18,6 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/011_backfill_checkpoints.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/012_topic_hierarchy.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/013_seed_topic_hierarchy.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/014_scoring_v3.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/015_general_method_application.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/016_bakeoff.sql
 echo "research_radar schema + watchlists installed."

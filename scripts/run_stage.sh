@@ -58,6 +58,17 @@ Stages (run in this order):
   9) final-score      Recompute ranking from stored assessments + org/person boosts (FREE)
  10) report           Markdown Top N from content_final_scores (FREE)
  11) show             Print top candidates (deterministic CANDIDATE pool)
+ 12) arxiv-backfill   arXiv OAI-PMH metadata backfill (FREE, explicit, not in `all`)
+                 --from/--until (ISO dates) required. --dry-run projects volume with
+                 zero writes. --force re-harvests COMPLETE checkpoint windows.
+ 13) topics           Hierarchical topic tags + key-claim extraction (PAID — needs
+                 --allow-paid). Annotation only, NOT scoring: runs on every
+                 RELEVANT-or-later paper, never changes content_items.status,
+                 not in `all`. --dry-run projects cost with zero calls/writes.
+ 14) corpus-search     Free, pure-SQL query over topics/claims (FREE, explicit,
+                 not in `all`). --tag/--subdomain/--application/--domain/--since
+                 filter (AND); --list-topics audits the tag vocabulary;
+                 --claims-for lists claims for a metric; --json/--out for output.
 
 `all` pipeline order (intentional, free/unattended — safe for cron):
   ingest → relevance → enrich → entities → score
@@ -83,6 +94,16 @@ Examples:
   ./scripts/run_stage.sh report --top 20 --out reports/research-radar-top20.md
   ./scripts/run_stage.sh report --top 20 --since-days 30 --out reports/top20-30d.md
   ./scripts/run_stage.sh show --top 10
+  ./scripts/run_stage.sh arxiv-backfill --from 2026-01-01 --until 2026-01-07 --dry-run
+  ./scripts/run_stage.sh arxiv-backfill --from 2026-01-01 --until 2026-08-31
+  ./scripts/run_stage.sh topics --dry-run
+  ./scripts/run_stage.sh topics --limit 100 --allow-paid
+  ./scripts/run_stage.sh topics --full --allow-paid
+  ./scripts/run_stage.sh corpus-search --tag "ai text detection" --top 20
+  ./scripts/run_stage.sh corpus-search --subdomain "Text Classification" --application education
+  ./scripts/run_stage.sh corpus-search --domain "Natural Language Processing" --with-claims --since 2026-01-01
+  ./scripts/run_stage.sh corpus-search --list-topics --min-usage 5
+  ./scripts/run_stage.sh corpus-search --claims-for "true negative rate"
 
 Logs are written to logs/ and also printed to the terminal.
 EOF

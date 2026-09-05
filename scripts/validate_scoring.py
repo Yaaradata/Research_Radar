@@ -154,11 +154,18 @@ def run_compression(conn, *, top: int = 20) -> str:
 def _score_batches_v2(batches: list[list[dict]], *, client) -> dict[int, dict]:
     """Real quality-scorer calls. Never persisted — in-memory only."""
     out: dict[int, dict] = {}
-    for batch in batches:
+    total = len(batches)
+    for i, batch in enumerate(batches, 1):
+        ids = [p["content_id"] for p in batch]
+        print(
+            f"[pass2 quality] batch {i}/{total} papers={len(batch)} ids={ids}",
+            flush=True,
+        )
         result = ss.call_quality_batch_with_retry(batch, client=client)
         out.update(result["results"])
         missing = {p["content_id"] for p in batch} - set(result["results"])
         for pid in missing:
+            print(f"[pass2 quality] retry single id={pid}", flush=True)
             paper = next(p for p in batch if p["content_id"] == pid)
             single = ss.call_quality_batch_with_retry([paper], client=client)
             out.update(single["results"])
@@ -501,11 +508,18 @@ def _load_paper_fields(conn, content_ids: list[int]) -> dict[int, dict]:
 
 def _score_batches_screen(batches: list[list[dict]], *, client) -> dict[int, dict]:
     out: dict[int, dict] = {}
-    for batch in batches:
+    total = len(batches)
+    for i, batch in enumerate(batches, 1):
+        ids = [p["content_id"] for p in batch]
+        print(
+            f"[pass1 screen] batch {i}/{total} papers={len(batch)} ids={ids}",
+            flush=True,
+        )
         result = ss.call_screen_batch_with_retry(batch, client=client)
         out.update(result["results"])
         missing = {p["content_id"] for p in batch} - set(result["results"])
         for pid in missing:
+            print(f"[pass1 screen] retry single id={pid}", flush=True)
             paper = next(p for p in batch if p["content_id"] == pid)
             single = ss.call_screen_batch_with_retry([paper], client=client)
             out.update(single["results"])
@@ -564,10 +578,22 @@ def run_tier_recall(conn, *, n: int = 400, dry_run: bool = False, client=None) -
     client = client or ss.create_llm_client()
 
     p2_batches = random_batches(sample, ss.QUALITY_BATCH_SIZE)
+    print(
+        f"Starting pass2 quality: {len(sample)} papers in {len(p2_batches)} batches "
+        f"(batch_size={ss.QUALITY_BATCH_SIZE})",
+        flush=True,
+    )
     p2_results = _score_batches_v2(p2_batches, client=client)
+    print(f"Pass2 done: scored={len(p2_results)}", flush=True)
 
     p1_batches = random_batches(sample, ss.SCREEN_BATCH_SIZE)
+    print(
+        f"Starting pass1 screen: {len(sample)} papers in {len(p1_batches)} batches "
+        f"(batch_size={ss.SCREEN_BATCH_SIZE})",
+        flush=True,
+    )
     p1_results = _score_batches_screen(p1_batches, client=client)
+    print(f"Pass1 done: screened={len(p1_results)}", flush=True)
 
     weights = fs.WEIGHT_PROFILES["radar-v2"]
     ground_truth = {cid: fs.compute_semantic_core(d, weights) for cid, d in p2_results.items()}

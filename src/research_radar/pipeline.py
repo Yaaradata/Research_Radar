@@ -2055,7 +2055,7 @@ def print_top_candidates(top=10):
             )
 
 
-PAID_STAGES = frozenset({"affiliation-gpt", "screen", "independence", "semantic-score"})
+PAID_STAGES = frozenset({"affiliation-gpt", "screen", "independence", "semantic-score", "topics"})
 
 
 class PaidStageNotAuthorised(RuntimeError):
@@ -2078,6 +2078,8 @@ def run_stage(
     top=None,
     rank_by=None,
     gate_percentile=None,
+    date_from=None,
+    date_until=None,
 ):
     if stage in PAID_STAGES and not dry_run and not allow_paid:
         raise PaidStageNotAuthorised(
@@ -2150,6 +2152,19 @@ def run_stage(
                     dry_run=dry_run,
                     force=force,
                 )
+            elif stage == "topics":
+                # Annotation stage, NOT scoring — runs on every RELEVANT-or-
+                # later paper (see topics.py's TOPICS_ELIGIBLE_STATUSES), does
+                # not change content_items.status, never in `all`.
+                from research_radar.topics import stage_topics
+
+                stage_topics(
+                    conn,
+                    run_id,
+                    limit=limit,
+                    dry_run=dry_run,
+                    force=force,
+                )
             elif stage == "semantic-compare":
                 from research_radar.semantic_scoring import print_semantic_compare
 
@@ -2210,6 +2225,17 @@ def run_stage(
                     print(f"Wrote {out} ({len(rows)} papers)")
                 else:
                     print(md)
+            elif stage == "arxiv-backfill":
+                from research_radar.arxiv_backfill import stage_arxiv_backfill
+
+                stage_arxiv_backfill(
+                    conn,
+                    run_id,
+                    date_from=date_from,
+                    date_until=date_until,
+                    dry_run=dry_run,
+                    force=force,
+                )
             elif stage == "all":
                 # `all` is the free/unattended path. Paid stages (affiliation-gpt,
                 # screen, semantic-score, independence — run in that order) are
@@ -2262,6 +2288,9 @@ def main():
             "final-score",
             "report",
             "show",
+            "arxiv-backfill",
+            "topics",
+            "corpus-search",
             "all",
         ],
         default="all",
@@ -2328,10 +2357,53 @@ def main():
         default="research",
         help="report: rank by research_score or newsletter_score (default research; radar-v2 only)",
     )
+    ap.add_argument(
+        "--from",
+        dest="date_from",
+        type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
+        default=None,
+        help="arxiv-backfill: start date (inclusive), ISO YYYY-MM-DD",
+    )
+    ap.add_argument(
+        "--until",
+        dest="date_until",
+        type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
+        default=None,
+        help="arxiv-backfill: end date (inclusive), ISO YYYY-MM-DD",
+    )
+    ap.add_argument("--tag", default=None, help="corpus-search: filter by level-3 topic (canonical name or alias)")
+    ap.add_argument("--subdomain", default=None, help="corpus-search: filter by subdomain")
+    ap.add_argument("--application", default=None, help="corpus-search: filter by application")
+    ap.add_argument("--domain", default=None, help="corpus-search: filter by domain")
+    ap.add_argument("--with-claims", action="store_true", help="corpus-search: only papers with extracted claims, and include them in output")
+    ap.add_argument("--since", default=None, help="corpus-search: ISO date/datetime lower bound for published_at")
+    ap.add_argument("--list-topics", action="store_true", help="corpus-search: print the tag vocabulary with usage counts")
+    ap.add_argument("--min-usage", type=int, default=None, help="corpus-search --list-topics: only topics with usage_count >= N")
+    ap.add_argument("--claims-for", default=None, help="corpus-search: list claims for a given metric name, ranked by value_num")
+    ap.add_argument("--json", action="store_true", help="corpus-search: JSON output instead of a table")
     args = ap.parse_args()
 
     if args.stage == "show":
         print_top_candidates(args.top)
+        return
+
+    if args.stage == "corpus-search":
+        from research_radar.corpus_query import run_corpus_search
+
+        run_corpus_search(
+            tag=args.tag,
+            subdomain=args.subdomain,
+            application=args.application,
+            domain=args.domain,
+            with_claims=args.with_claims,
+            since=args.since,
+            list_topics_flag=args.list_topics,
+            min_usage=args.min_usage,
+            claims_for=args.claims_for,
+            top=args.top,
+            as_json=args.json,
+            out=args.out,
+        )
         return
 
     if args.stage == "semantic-score" and args.full is False and args.sample is None:
@@ -2352,6 +2424,8 @@ def main():
         top=args.top,
         rank_by=args.rank_by,
         gate_percentile=args.gate_percentile,
+        date_from=args.date_from,
+        date_until=args.date_until,
     )
     print(f"\nSTAGE COMPLETED: {args.stage} run_id={run_id}")
     if args.stage in {"score", "all"}:

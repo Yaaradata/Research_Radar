@@ -1,0 +1,132 @@
+---
+description: Research Radar standing rules — migrations, stages, budgets, traps. Always applied in this repo.
+alwaysApply: true
+---
+
+# Research Radar — project rules
+
+## What this repo is
+
+Staged pipeline over `research_radar` schema on shared RDS Postgres: Inoreader/arXiv
+ingestion → relevance → enrich → entities → (paid) screen → semantic-score →
+independence → final-score. Produces scored paper corpus for newsletter and advisory.
+
+Code lives in `src/research_radar/`. Migrations in `sql/` (numbered, apply in order via
+`scripts/setup_db.sh`). Tests in `tests/`.
+
+## Stage order (load-bearing)
+
+```text
+ingest → relevance → enrich → entities → [affiliation-gpt] → screen → semantic-score → independence → final-score
+```
+
+`all` (cron path) runs only: ingest → relevance → enrich → entities — never paid stages.
+
+**Paid stages** (`PAID_STAGES` in `pipeline.py`): `affiliation-gpt`, `screen`,
+`semantic-score`, `independence`, `topics`. Each requires `--allow-paid` on the CLI.
+Run `scoring-cost` first (free) to see projected spend.
+
+**Blinding:** quality scoring (`semantic_scoring.py`) sees title + abstract + categories
+only — never affiliation. Independence (`independence.py`) is the only stage that may see
+`affiliation_text`. Do not merge these calls.
+
+**Tiering:** `screen` runs on all eligible papers; `semantic-score` and `independence`
+run only on the top `GATE_PERCENTILE`% of screen scores (`ai_relevance > 3` gate in code).
+`final-score` runs only on `scoring_tier='full'` rows.
+
+## Migrations and database roles
+
+- **No DDL by agents.** Write numbered `.sql` files under `sql/`, leave unapplied. Human
+  applies as admin (`neural_admin` / `DATABASE_URL` with create privileges).
+- Each migration: `BEGIN`/`COMMIT`, explicit grants where needed.
+- **Connection:** `DATABASE_URL` or `PG_DSN` from `.env` (never echo values).
+- **Read-only scout/verifier:** prefer `PG_DSN_RO` / `neural_ro` when available.
+- Schema: `research_radar.*` — `content_items`, `paper_metadata`, `content_score_assessments`,
+  `content_independence_assessments`, `content_final_scores`, `processing_events`, etc.
+
+## Config — no literals in stage code
+
+All thresholds, models, batch sizes, and rate limits come from environment variables
+documented in `README.md`. If a value is missing from config/env, say so and stop — do not
+inline a literal.
+
+Key env vars:
+
+| Variable | Purpose |
+|---|---|
+| `GATE_PERCENTILE` | Top % of screen scores reaching pass 2 (default 15) |
+| `SCREEN_MODEL` | Pass-1 model (default `anthropic/claude-haiku-4.5`) |
+| `OPENROUTER_API_KEY` | Required for paid stages |
+| `SCORING_CONCURRENCY` | Shared worker pool for paid LLM stages |
+| `ARXIV_REQUEST_SLEEP` | arXiv throttle (OURS — not a provider header) |
+
+Set `GATE_PERCENTILE` from measured recall (`scripts/validate_scoring.py --test tier-recall`),
+never from a cost target.
+
+## Tests and validation
+
+```bash
+cd /home/ubuntu/Research_Radar1
+source .venv/bin/activate
+export PYTHONPATH=src
+python -m pytest tests/ -q
+python scripts/validate_scoring.py --help   # paid tests need --allow-paid
+python scripts/golden_test.py
+```
+
+Static check before any paid run. Paid validation tests: `batch-stability`, `affiliation-leak`,
+`tier-recall`.
+
+## Verification artifacts
+
+| Deliverable | Primary artifact |
+|---|---|
+| Pipeline stage | `research_radar.processing_events`, stage-specific tables |
+| LLM assessment | `content_score_assessments` / `content_independence_assessments` rows |
+| Migration | File on disk in `sql/` (not applied rows until human runs it) |
+| Scoring change | Updated prompts in code + tests in `tests/test_scoring_v2.py` |
+
+Verifier recounts from DB or file — never stdout.
+
+## Standing rules
+
+1. One change at a time, report between.
+2. Prefer NULL to a plausible default. Never stamp naive timestamps as UTC.
+3. Never compute min/max published_at positionally — use MIN()/MAX() in SQL or explicit sort.
+4. A stage that finds zero work exits non-zero and prints why.
+5. Label rate limits OURS vs THEIRS. arXiv throttle and OpenRouter concurrency are OURS.
+6. Sample to form a hypothesis, never to state a rate.
+7. Provisional enums must be marked `VOCAB_PROVISIONAL` and enforced by DDL CHECK — unenforced
+   enums become seventeen values (`items.tier` precedent).
+
+## Known traps (this codebase)
+
+1. **`ai_relevance` is a gate, not a ranking dimension** at quality stage (`final_score.py`
+   excludes it). Screen ranking must match — do not include `ai_relevance` in the screen
+   gate mean.
+
+2. **Gate-collapse prompt instruction destroys measurements.** Both scoring prompts must NOT
+   tell the model to score other dimensions ≤3 when `ai_relevance` is low. The code gate
+   handles drops; stored scores must remain honest measurements.
+
+3. **Quality scorer must never see affiliation.** Any leak invalidates the blinding guarantee.
+   `validate_scoring.py --test affiliation-leak` exists to catch this.
+
+4. **`topics` stage ≠ `classify` pass (v3).** `topics` tags domain/subdomain/claims on all
+   RELEVANT+ papers. Scoring v3 `classify` is a separate pass for application_domain,
+   audience_relevance, paper_kind — runs before the gate on the full eligible pool.
+
+5. **Eligible-paper filters must not use `status = 'RELEVANT'` only.** arXiv papers advance
+   past RELEVANT immediately after enrich. Use the same eligible-status tuple as
+   `load_quality_candidates()` / `topics.py`.
+
+6. **HTTP 403/429 on arXiv or publisher URLs is access denied, not absence.** Query the DB.
+
+7. **Two independently derived enums for the same field fail silently on join.** Vocabulary
+   for `classify` is provisional until aligned with the main pipeline derivation backlog.
+
+## Active work
+
+Scoring v3 (see uploaded brief): (1) new `classify` pass + `content_classifications` table,
+(2) remove gate-collapse from prompts, (3) drop `ai_relevance` from screen ranking mean,
+(4) independence emits `paper_kind`. Implement one change at a time.

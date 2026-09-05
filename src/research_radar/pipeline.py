@@ -59,6 +59,7 @@ ARXIV_WORKERS = int(os.getenv("ARXIV_WORKERS", "4"))
 ARXIV_COMMIT_EVERY = int(os.getenv("ARXIV_COMMIT_EVERY", "10"))
 PIPELINE_WORKERS = int(os.getenv("PIPELINE_WORKERS", str(ARXIV_WORKERS)))
 MIN_AI_RELEVANCE = float(os.getenv("MIN_AI_RELEVANCE_FOR_ENRICHMENT", "5.0"))
+RELEVANCE_VERSION = os.getenv("RELEVANCE_VERSION", "relevance-v1").strip() or "relevance-v1"
 MIN_CANDIDATE_SCORE = float(os.getenv("MIN_INTRINSIC_CANDIDATE_SCORE", "5.5"))
 SCORE_INCLUDE_PERSON_SIGNAL = os.getenv("SCORE_INCLUDE_PERSON_SIGNAL", "auto").strip().lower()
 
@@ -581,6 +582,13 @@ def set_status(conn,content_id,status):
 
 def event(conn,run_id,content_id,stage,event_type,success,details=None,error=None):
     with conn.cursor() as cur: cur.execute("INSERT INTO research_radar.processing_events(run_id,content_id,stage,event_type,success,error_message,details) VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)",(run_id,content_id,stage,event_type,success,error,json.dumps(details or {},default=str)))
+
+
+def set_relevance_version(conn, content_id: int, version: str):
+    conn.execute(
+        "UPDATE research_radar.content_items SET relevance_version=%s, modified_at=NOW() WHERE id=%s",
+        (version, content_id),
+    )
 
 
 def store_relevance(conn,content_id,score,primary,secondary,reason):
@@ -1138,6 +1146,12 @@ def stage_ingest(conn, run_id, limit=None):
         items = items[:limit]
     bump(conn, run_id, "items_received", len(items))
     log.info("Ingest: received %d items from Inoreader/fixture", len(items))
+
+    from research_radar.archive import archive_raw
+
+    raw_payloads = [item.get("raw_metadata") or item for item in items]
+    archive_raw(conn, run_id, "inoreader", raw_payloads)
+
     for i, item in enumerate(items, 1):
         content_id, is_new = upsert_item(conn, item)
         bump(conn, run_id, "items_new" if is_new else "items_duplicate")
@@ -1228,40 +1242,106 @@ def stage_repair_timestamps(conn, run_id, limit=None):
     return updated
 
 
-def stage_relevance(conn, run_id, limit=None):
-    rows = conn.execute(
-        """
-        SELECT id, title, summary, categories_raw, source_type
-        FROM research_radar.content_items
-        WHERE status IN ('INGESTED', 'RELEVANCE_CHECKED', 'ERROR')
-        ORDER BY id
-        LIMIT %s
-        """,
-        (limit or 10_000,),
-    ).fetchall()
+def stage_relevance(conn, run_id, limit=None, *, reprocess_version: str | None = None):
+    if reprocess_version:
+        rows = conn.execute(
+            """
+            SELECT ci.id, ci.title, ci.summary, ci.categories_raw, ci.source_type,
+                   ci.canonical_url, pm.arxiv_id, pm.abstract
+            FROM research_radar.content_items ci
+            LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
+            WHERE ci.status IN ('INGESTED', 'RELEVANCE_CHECKED', 'ERROR')
+               OR (ci.status = 'REJECTED' AND ci.relevance_version IS DISTINCT FROM %s)
+            ORDER BY ci.id
+            LIMIT %s
+            """,
+            (RELEVANCE_VERSION, limit or 10_000),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT ci.id, ci.title, ci.summary, ci.categories_raw, ci.source_type,
+                   ci.canonical_url, pm.arxiv_id, pm.abstract
+            FROM research_radar.content_items ci
+            LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
+            WHERE ci.status IN ('INGESTED', 'RELEVANCE_CHECKED', 'ERROR')
+            ORDER BY ci.id
+            LIMIT %s
+            """,
+            (limit or 10_000,),
+        ).fetchall()
     log.info("Relevance: processing %d items", len(rows))
-    for i, row in enumerate(rows, 1):
+
+    from research_radar.archive import archive_rejected, build_rejected_record
+
+    outcomes = []
+    for row in rows:
         try:
             score, primary, secondary, reason = score_relevance(
                 row["title"], row.get("summary") or "", row.get("categories_raw") or [], row["source_type"]
             )
             store_relevance(conn, row["id"], score, primary, secondary, reason)
+            set_relevance_version(conn, row["id"], RELEVANCE_VERSION)
+            outcomes.append((row, score, primary, reason, None))
+        except Exception as exc:
+            outcomes.append((row, None, None, None, exc))
+
+    reject_records = []
+    for row, score, primary, reason, exc in outcomes:
+        if exc is not None or score is None:
+            continue
+        if score < MIN_AI_RELEVANCE:
+            reject_records.append(
+                build_rejected_record(
+                    content_id=row["id"],
+                    canonical_url=row["canonical_url"],
+                    title=row["title"] or "",
+                    abstract=row.get("abstract") or row.get("summary") or "",
+                    categories=row.get("categories_raw") or [],
+                    relevance_score=score,
+                    primary_topic=primary,
+                    rejection_reason=reason or "below MIN_AI_RELEVANCE",
+                    relevance_version=RELEVANCE_VERSION,
+                    arxiv_id=row.get("arxiv_id"),
+                )
+            )
+    if reject_records:
+        archive_rejected(conn, run_id, "relevance", reject_records)
+
+    for i, (row, score, primary, reason, exc) in enumerate(outcomes, 1):
+        try:
+            if exc is not None:
+                raise exc
             set_status(conn, row["id"], "RELEVANCE_CHECKED")
-            event(conn, run_id, row["id"], "relevance", "deterministic_relevance", True, {"score": score, "primary_topic": primary, "reason": reason})
+            event(
+                conn,
+                run_id,
+                row["id"],
+                "relevance",
+                "deterministic_relevance",
+                True,
+                {"score": score, "primary_topic": primary, "reason": reason, "relevance_version": RELEVANCE_VERSION},
+            )
             if score < MIN_AI_RELEVANCE:
                 set_status(conn, row["id"], "REJECTED")
                 log.info("Relevance REJECTED id=%s score=%.2f title=%s", row["id"], score, (row["title"] or "")[:80])
             else:
                 bump(conn, run_id, "items_relevant")
                 set_status(conn, row["id"], "RELEVANT")
-                log.info("Relevance KEEP id=%s score=%.2f topic=%s title=%s", row["id"], score, primary, (row["title"] or "")[:80])
+                log.info(
+                    "Relevance KEEP id=%s score=%.2f topic=%s title=%s",
+                    row["id"],
+                    score,
+                    primary,
+                    (row["title"] or "")[:80],
+                )
         except Exception as exc:
             log.exception("Relevance failed id=%s", row["id"])
             set_status(conn, row["id"], "ERROR")
             bump(conn, run_id, "errors")
             event(conn, run_id, row["id"], "relevance", "processing_error", False, {"title": row.get("title")}, str(exc))
-        if i % 25 == 0 or i == len(rows):
-            log.info("Relevance progress %d/%d", i, len(rows))
+        if i % 25 == 0 or i == len(outcomes):
+            log.info("Relevance progress %d/%d", i, len(outcomes))
     return len(rows)
 
 
@@ -2080,6 +2160,7 @@ def run_stage(
     gate_percentile=None,
     date_from=None,
     date_until=None,
+    reprocess_version: str | None = None,
 ):
     if stage in PAID_STAGES and not dry_run and not allow_paid:
         raise PaidStageNotAuthorised(
@@ -2095,7 +2176,7 @@ def run_stage(
             if stage == "ingest":
                 stage_ingest(conn, run_id, limit=limit)
             elif stage == "relevance":
-                stage_relevance(conn, run_id, limit=limit)
+                stage_relevance(conn, run_id, limit=limit, reprocess_version=reprocess_version)
             elif stage == "enrich":
                 stage_enrich(conn, run_id, limit=limit)
             elif stage == "entities":
@@ -2386,12 +2467,20 @@ def main():
     ap.add_argument("--subdomain", default=None, help="corpus-search: filter by subdomain")
     ap.add_argument("--application", default=None, help="corpus-search: filter by application")
     ap.add_argument("--domain", default=None, help="corpus-search: filter by domain")
+    ap.add_argument("--paper-kind", default=None, help="corpus-search: filter by independence paper_kind")
     ap.add_argument("--with-claims", action="store_true", help="corpus-search: only papers with extracted claims, and include them in output")
     ap.add_argument("--since", default=None, help="corpus-search: ISO date/datetime lower bound for published_at")
     ap.add_argument("--list-topics", action="store_true", help="corpus-search: print the tag vocabulary with usage counts")
     ap.add_argument("--min-usage", type=int, default=None, help="corpus-search --list-topics: only topics with usage_count >= N")
     ap.add_argument("--claims-for", default=None, help="corpus-search: list claims for a given metric name, ranked by value_num")
     ap.add_argument("--json", action="store_true", help="corpus-search: JSON output instead of a table")
+    ap.add_argument(
+        "--reprocess-version",
+        nargs="?",
+        const=RELEVANCE_VERSION,
+        default=None,
+        help="relevance: also re-select REJECTED papers whose relevance_version differs from current",
+    )
     args = ap.parse_args()
 
     if args.stage == "show":
@@ -2414,6 +2503,7 @@ def main():
             top=args.top,
             as_json=args.json,
             out=args.out,
+            paper_kind=args.paper_kind,
         )
         return
 
@@ -2437,6 +2527,7 @@ def main():
         gate_percentile=args.gate_percentile,
         date_from=args.date_from,
         date_until=args.date_until,
+        reprocess_version=args.reprocess_version,
     )
     print(f"\nSTAGE COMPLETED: {args.stage} run_id={run_id}")
     if args.stage in {"score", "all"}:

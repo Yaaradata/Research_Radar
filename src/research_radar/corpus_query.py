@@ -40,6 +40,7 @@ def search_corpus(
     subdomain: str | None = None,
     application: str | None = None,
     domain: str | None = None,
+    paper_kind: str | None = None,
     with_claims: bool = False,
     since: str | None = None,
     top: int = 20,
@@ -59,6 +60,12 @@ def search_corpus(
     if domain:
         filters.append(_level_condition("ci", "domain", "domain"))
         params["domain"] = domain
+    if paper_kind:
+        filters.append(
+            "EXISTS (SELECT 1 FROM research_radar.content_independence_assessments cia "
+            "WHERE cia.content_id = ci.id AND cia.paper_kind = %(paper_kind)s)"
+        )
+        params["paper_kind"] = paper_kind
     if with_claims:
         filters.append("EXISTS (SELECT 1 FROM research_radar.content_claims cc WHERE cc.content_id = ci.id)")
     if since:
@@ -210,6 +217,7 @@ def run_corpus_search(
     subdomain=None,
     application=None,
     domain=None,
+    paper_kind=None,
     with_claims=False,
     since=None,
     list_topics_flag=False,
@@ -235,6 +243,7 @@ def run_corpus_search(
                 subdomain=subdomain,
                 application=application,
                 domain=domain,
+                paper_kind=paper_kind,
                 with_claims=with_claims,
                 since=since,
                 top=top,

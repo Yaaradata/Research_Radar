@@ -375,7 +375,7 @@ class BackfillTotals:
         self.records_revision += w.records_revision
 
 
-def _run_one_window(conn, set_spec, window_from, window_until) -> WindowStats:
+def _run_one_window(conn, set_spec, window_from, window_until, *, raw_writer=None) -> WindowStats:
     stats = WindowStats()
     for rec in fetch_window_records(set_spec, window_from, window_until):
         stats.records_seen += 1
@@ -390,6 +390,9 @@ def _run_one_window(conn, set_spec, window_from, window_until) -> WindowStats:
         if created_year is not None and created_year < window_from.year:
             stats.records_revision += 1
 
+        if raw_writer is not None:
+            raw_writer.write(rec)
+
         item = record_to_item(rec)
         content_id, is_new = upsert_item(conn, item)
         if is_new:
@@ -401,41 +404,54 @@ def _run_one_window(conn, set_spec, window_from, window_until) -> WindowStats:
     return stats
 
 
-def run_backfill(conn, date_from: date, date_until: date, *, force: bool = False) -> BackfillTotals:
-    totals = BackfillTotals()
-    for set_spec in OAI_SETS:
-        for window_from, window_until in _iter_windows(date_from, date_until):
-            if not force and checkpoint_status(conn, SOURCE, set_spec, window_from, window_until) == "COMPLETE":
-                log.info(
-                    "arxiv-backfill set=%s window=%s..%s SKIP (checkpoint COMPLETE)",
-                    set_spec, window_from, window_until,
-                )
-                totals.windows_skipped += 1
-                continue
+def run_backfill(conn, date_from: date, date_until: date, *, force: bool = False, run_id=None) -> BackfillTotals:
+    from uuid import UUID
 
-            start_checkpoint(conn, SOURCE, set_spec, window_from, window_until)
-            conn.commit()
-            started = time.monotonic()
-            try:
-                stats = _run_one_window(conn, set_spec, window_from, window_until)
-                finish_checkpoint(conn, SOURCE, set_spec, window_from, window_until, status="COMPLETE", stats=stats)
+    from research_radar.archive import RawArchiveWriter
+
+    run_uuid = UUID(str(run_id)) if run_id is not None else None
+    totals = BackfillTotals()
+    writer = None
+    if run_uuid is not None:
+        writer = RawArchiveWriter(run_uuid, SOURCE)
+        writer.__enter__()
+    try:
+        for set_spec in OAI_SETS:
+            for window_from, window_until in _iter_windows(date_from, date_until):
+                if not force and checkpoint_status(conn, SOURCE, set_spec, window_from, window_until) == "COMPLETE":
+                    log.info(
+                        "arxiv-backfill set=%s window=%s..%s SKIP (checkpoint COMPLETE)",
+                        set_spec, window_from, window_until,
+                    )
+                    totals.windows_skipped += 1
+                    continue
+
+                start_checkpoint(conn, SOURCE, set_spec, window_from, window_until)
                 conn.commit()
-                totals.add(stats)
-                totals.windows_run += 1
-                elapsed = int(time.monotonic() - started)
-                log.info(
-                    "arxiv-backfill set=%s window=%s..%s records=%d kept=%d new=%d dupe=%d elapsed=%ds",
-                    set_spec, window_from, window_until,
-                    stats.records_seen, stats.records_kept, stats.records_new, stats.records_dupe, elapsed,
-                )
-            except Exception as exc:
-                conn.rollback()
-                empty = WindowStats()
-                finish_checkpoint(conn, SOURCE, set_spec, window_from, window_until, status="FAILED", stats=empty, error=str(exc)[:2000])
-                conn.commit()
-                totals.windows_failed += 1
-                totals.failures.append((set_spec, str(window_from), str(window_until), str(exc)))
-                log.exception("arxiv-backfill set=%s window=%s..%s FAILED", set_spec, window_from, window_until)
+                started = time.monotonic()
+                try:
+                    stats = _run_one_window(conn, set_spec, window_from, window_until, raw_writer=writer)
+                    finish_checkpoint(conn, SOURCE, set_spec, window_from, window_until, status="COMPLETE", stats=stats)
+                    conn.commit()
+                    totals.add(stats)
+                    totals.windows_run += 1
+                    elapsed = int(time.monotonic() - started)
+                    log.info(
+                        "arxiv-backfill set=%s window=%s..%s records=%d kept=%d new=%d dupe=%d elapsed=%ds",
+                        set_spec, window_from, window_until,
+                        stats.records_seen, stats.records_kept, stats.records_new, stats.records_dupe, elapsed,
+                    )
+                except Exception as exc:
+                    conn.rollback()
+                    empty = WindowStats()
+                    finish_checkpoint(conn, SOURCE, set_spec, window_from, window_until, status="FAILED", stats=empty, error=str(exc)[:2000])
+                    conn.commit()
+                    totals.windows_failed += 1
+                    totals.failures.append((set_spec, str(window_from), str(window_until), str(exc)))
+                    log.exception("arxiv-backfill set=%s window=%s..%s FAILED", set_spec, window_from, window_until)
+    finally:
+        if writer is not None:
+            writer.finish(conn, window_from=date_from, window_until=date_until)
     return totals
 
 
@@ -563,7 +579,7 @@ def stage_arxiv_backfill(conn, run_id, *, date_from: date, date_until: date, dry
         print_dry_run(projection)
         return projection
 
-    totals = run_backfill(conn, date_from, date_until, force=force)
+    totals = run_backfill(conn, date_from, date_until, force=force, run_id=run_id)
 
     print("\nARXIV BACKFILL SUMMARY")
     print(f"  windows run={totals.windows_run} skipped(complete)={totals.windows_skipped} failed={totals.windows_failed}")

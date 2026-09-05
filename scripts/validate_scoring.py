@@ -606,10 +606,10 @@ def run_tier_recall(conn, *, n: int = 400, dry_run: bool = False, client=None) -
         ai_rel = d.get("ai_relevance")
         if ai_rel is None or ai_rel <= ss.SCREEN_AI_RELEVANCE_FLOOR:
             continue
-        vals = [d.get(k) for k in ss.SCREEN_NUMERIC_FIELDS]
+        vals = [d.get(k) for k in ss.SCREEN_RANKING_FIELDS]
         if any(v is None for v in vals):
             continue
-        screen_ranked.append((cid, sum(vals) / len(vals)))
+        screen_ranked.append((cid, sum(float(v) for v in vals) / len(vals)))
     screen_ranked.sort(key=lambda x: (-x[1], x[0]))
     screen_pool_n = len(screen_ranked)
 
@@ -652,12 +652,132 @@ def run_tier_recall(conn, *, n: int = 400, dry_run: bool = False, client=None) -
     return "\n".join(lines) + "\n"
 
 
+# ===========================================================================
+# --test screen-quality-agreement (free — SQL only)
+# ===========================================================================
+
+SHARED_SCREEN_DIMS = ("ai_relevance", "technical_significance", "apparent_novelty", "evidence_strength")
+QUALITY_TOP_N = 50
+
+
+def run_screen_quality_agreement(conn) -> str:
+    version_row = conn.execute(
+        """
+        SELECT s.prompt_version AS screen_version, q.prompt_version AS quality_version, COUNT(*) AS n
+        FROM research_radar.content_score_assessments s
+        JOIN research_radar.content_score_assessments q ON q.content_id = s.content_id
+        WHERE s.scoring_tier = 'screen' AND s.status = 'COMPLETED'
+          AND q.scoring_tier = 'full' AND q.status = 'COMPLETED'
+        GROUP BY 1, 2
+        ORDER BY n DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    if not version_row:
+        return (
+            "# Screen vs quality agreement\n\n"
+            "No papers with both screen and quality assessments.\n"
+        )
+
+    screen_ver = version_row["screen_version"]
+    quality_ver = version_row["quality_version"]
+
+    rows = conn.execute(
+        """
+        SELECT
+            s.content_id,
+            s.ai_relevance AS s_ai_relevance,
+            s.technical_significance AS s_technical_significance,
+            s.apparent_novelty AS s_apparent_novelty,
+            s.evidence_strength AS s_evidence_strength,
+            q.ai_relevance AS q_ai_relevance,
+            q.technical_significance AS q_technical_significance,
+            q.apparent_novelty AS q_apparent_novelty,
+            q.evidence_strength AS q_evidence_strength
+        FROM research_radar.content_score_assessments s
+        JOIN research_radar.content_score_assessments q
+          ON q.content_id = s.content_id
+        WHERE s.scoring_tier = 'screen'
+          AND s.status = 'COMPLETED'
+          AND s.prompt_version = %s
+          AND q.scoring_tier = 'full'
+          AND q.status = 'COMPLETED'
+          AND q.prompt_version = %s
+        """,
+        (screen_ver, quality_ver),
+    ).fetchall()
+
+    lines = [
+        "# Screen vs quality agreement",
+        "",
+        f"**Generated:** {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}  ",
+        f"**Papers with both assessments:** {len(rows)}  ",
+        f"**Screen prompt:** `{screen_ver}`  ",
+        f"**Quality prompt:** `{quality_ver}`  ",
+        f"*(current defaults: screen=`{ss.SCREEN_PROMPT_VERSION}`, quality=`{ss.QUALITY_PROMPT_VERSION}`)*  ",
+        f"**GATE_PERCENTILE:** {ss.GATE_PERCENTILE}  ",
+        "",
+        "| dimension | spearman | mean_abs_diff | mean_bias (screen−quality) |",
+        "|---|---|---|---|",
+    ]
+
+    for dim in SHARED_SCREEN_DIMS:
+        xs = [float(r[f"s_{dim}"]) for r in rows if r.get(f"s_{dim}") is not None and r.get(f"q_{dim}") is not None]
+        ys = [float(r[f"q_{dim}"]) for r in rows if r.get(f"s_{dim}") is not None and r.get(f"q_{dim}") is not None]
+        if len(xs) < 2:
+            lines.append(f"| {dim} | insufficient data | | |")
+            continue
+        diffs = [a - b for a, b in zip(xs, ys)]
+        lines.append(
+            f"| {dim} | {_spearman(xs, ys):.3f} | "
+            f"{sum(abs(d) for d in diffs) / len(diffs):.3f} | "
+            f"{sum(diffs) / len(diffs):+.3f} |"
+        )
+
+    quality_scores: list[tuple[int, float]] = []
+    screen_scores: dict[int, float] = {}
+    for r in rows:
+        cid = int(r["content_id"])
+        qvals = [float(r[f"q_{d}"]) for d in SHARED_SCREEN_DIMS if r.get(f"q_{d}") is not None]
+        svals = [float(r[f"s_{d}"]) for d in ss.SCREEN_RANKING_FIELDS if r.get(f"s_{d}") is not None]
+        if len(qvals) == len(SHARED_SCREEN_DIMS):
+            quality_scores.append((cid, sum(qvals) / len(qvals)))
+        if len(svals) == len(ss.SCREEN_RANKING_FIELDS):
+            ai = r.get("s_ai_relevance")
+            if ai is not None and float(ai) > ss.SCREEN_AI_RELEVANCE_FLOOR:
+                screen_scores[cid] = sum(svals) / len(svals)
+
+    quality_scores.sort(key=lambda x: (-x[1], x[0]))
+    quality_top = {cid for cid, _ in quality_scores[:QUALITY_TOP_N]}
+
+    screen_ranked = sorted(screen_scores.items(), key=lambda x: (-x[1], x[0]))
+    gate_k = math.ceil(len(screen_ranked) * ss.GATE_PERCENTILE / 100.0) if screen_ranked else 0
+    screen_top = {cid for cid, _ in screen_ranked[:gate_k]}
+
+    overlap = len(quality_top & screen_top)
+    recall = overlap / len(quality_top) if quality_top else 0.0
+
+    lines.extend(
+        [
+            "",
+            "## Gate recall on stored data",
+            "",
+            f"Quality top {QUALITY_TOP_N} (mean of 4 shared dims): **{len(quality_top)}** papers  ",
+            f"Screen top {ss.GATE_PERCENTILE}% (ranking mean excludes ai_relevance; ai_relevance>{ss.SCREEN_AI_RELEVANCE_FLOOR:g} gate): **{len(screen_top)}** papers  ",
+            f"**Overlap:** {overlap}  ",
+            f"**Fraction of quality top-{QUALITY_TOP_N} captured by screen gate:** {recall:.1%}  ",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Scoring v2 validation harness")
     ap.add_argument(
         "--test",
         required=True,
-        choices=["compression", "batch-stability", "affiliation-leak", "human-agreement", "tier-recall"],
+        choices=["compression", "batch-stability", "affiliation-leak", "human-agreement", "tier-recall", "screen-quality-agreement"],
     )
     ap.add_argument(
         "--n",
@@ -694,6 +814,9 @@ def main():
         elif args.test == "tier-recall":
             report = run_tier_recall(conn, n=args.n, dry_run=args.dry_run)
             path = _write_report("tier_recall", report)
+        elif args.test == "screen-quality-agreement":
+            report = run_screen_quality_agreement(conn)
+            path = _write_report("screen_quality_agreement", report)
         else:
             raise SystemExit(f"Unknown --test {args.test}")
 

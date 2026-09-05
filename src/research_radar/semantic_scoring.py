@@ -1599,8 +1599,8 @@ def load_quality_candidates(
     conn,
     limit: int | None = None,
     *,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
 ) -> list[dict]:
     """
     ENTITY_RESOLVED, SCORED or CANDIDATE papers, title+categories+abstract only.
@@ -1611,11 +1611,11 @@ def load_quality_candidates(
     ENTITY_RESOLVED *instead of* SCORED/CANDIDATE — that would have made this
     stage select nothing for the entire pre-existing corpus).
 
-    Optional ``since`` / ``until`` bound ``ci.published_at`` (until is inclusive).
+    Optional ``date_from`` / ``date_until`` bound ``ci.published_at`` (until inclusive).
     """
     from research_radar.candidate_window import published_at_sql_filters
 
-    window_sql, window_params = published_at_sql_filters(since, until)
+    window_sql, window_params = published_at_sql_filters(date_from, date_until)
     rows = conn.execute(
         f"""
         SELECT
@@ -1642,22 +1642,44 @@ SCREEN_AI_RELEVANCE_FLOOR = 3.0
 SCREEN_RANKING_FIELDS = ["technical_significance", "apparent_novelty", "evidence_strength"]
 
 
-def select_gated_content_ids(conn, *, gate_percentile: float | None = None) -> list[int]:
+def select_gated_content_ids(
+    conn,
+    *,
+    gate_percentile: float | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
+) -> list[int]:
     """
     Rank COMPLETED screen assessments by the mean of technical_significance,
     apparent_novelty and evidence_strength. Drop ai_relevance <= 3 outright, and
     return the content_ids in the top `gate_percentile` percent. Pure Python
     ranking over a DB read — same style as final_score.py's org/person boosts.
     Makes no API calls.
+
+    When ``date_from`` / ``date_until`` are set, only papers in that published_at
+    window are ranked — the gate is the top percentile *within the window*, not
+    the corpus-wide gate intersected with the window.
     """
+    from research_radar.candidate_window import published_at_sql_filters
+
     gate_percentile = GATE_PERCENTILE if gate_percentile is None else gate_percentile
+    window_sql, window_params = published_at_sql_filters(date_from, date_until)
     rows = conn.execute(
-        """
-        SELECT content_id, ai_relevance, technical_significance, apparent_novelty, evidence_strength
-        FROM research_radar.content_score_assessments
-        WHERE prompt_version = %s AND scoring_tier = 'screen' AND status = 'COMPLETED'
+        f"""
+        SELECT
+            a.content_id,
+            a.ai_relevance,
+            a.technical_significance,
+            a.apparent_novelty,
+            a.evidence_strength
+        FROM research_radar.content_score_assessments a
+        JOIN research_radar.content_items ci ON ci.id = a.content_id
+        WHERE a.prompt_version = %s
+          AND a.scoring_tier = 'screen'
+          AND a.status = 'COMPLETED'
+        {window_sql}
         """,
-        (SCREEN_PROMPT_VERSION,),
+        (SCREEN_PROMPT_VERSION, *window_params),
     ).fetchall()
 
     ranked: list[tuple[int, float]] = []
@@ -1681,18 +1703,20 @@ def load_gated_quality_candidates(
     *,
     gate_percentile: float | None = None,
     limit: int | None = None,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
 ) -> list[dict]:
     """Papers that passed the screen gate — the pool pass 2 actually scores."""
-    from research_radar.candidate_window import published_at_sql_filters
-
-    gated_ids = select_gated_content_ids(conn, gate_percentile=gate_percentile)
+    gated_ids = select_gated_content_ids(
+        conn,
+        gate_percentile=gate_percentile,
+        date_from=date_from,
+        date_until=date_until,
+    )
     if not gated_ids:
         return []
-    window_sql, window_params = published_at_sql_filters(since, until)
     rows = conn.execute(
-        f"""
+        """
         SELECT
             ci.id AS content_id,
             ci.title,
@@ -1701,11 +1725,10 @@ def load_gated_quality_candidates(
         FROM research_radar.content_items ci
         LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
         WHERE ci.id = ANY(%s)
-        {window_sql}
         ORDER BY ci.id
         LIMIT %s
         """,
-        (gated_ids, *window_params, limit or 10_000),
+        (gated_ids, limit or 10_000),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1724,8 +1747,8 @@ def stage_semantic_score_v2(
     dry_run: bool = False,
     force: bool = False,
     gate_percentile: float | None = None,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
     client=None,
 ):
     """
@@ -1741,16 +1764,19 @@ def stage_semantic_score_v2(
         require_api_key()
 
     candidates = load_gated_quality_candidates(
-        conn, gate_percentile=gate_percentile, since=since, until=until
+        conn,
+        gate_percentile=gate_percentile,
+        date_from=date_from,
+        date_until=date_until,
     )
     if not force:
         candidates = [c for c in candidates if not quality_assessment_exists(conn, c["content_id"])]
 
     if not candidates:
-        from research_radar.candidate_window import merge_window_summary, print_empty_candidate_pool
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        print_empty_candidate_pool("SEMANTIC SCORE V2 (PASS 2)", since, until)
-        summary = merge_window_summary({"requested": 0, "gate_percentile": gate_percentile}, since, until)
+        print_stage_run_line("semantic-score", date_from, date_until, candidates=0)
+        summary = merge_window_summary({"requested": 0, "gate_percentile": gate_percentile}, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"semantic_score_v2_empty": summary}), run_id),
@@ -1778,20 +1804,22 @@ def stage_semantic_score_v2(
         stats.calls = len(batches)
         summary = stats.to_dict()
         summary["gate_percentile"] = gate_percentile
-        from research_radar.candidate_window import merge_window_summary
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        summary = merge_window_summary(summary, since, until)
+        summary = merge_window_summary(summary, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"semantic_score_v2_dry_run": summary}), run_id),
         )
         log.info("Quality v2 DRY RUN: %s", json.dumps(summary))
-        print("\nSEMANTIC SCORE V2 (PASS 2) DRY RUN")
-        print(f"  published_window: {summary['published_window']}")
-        print(f"  candidates: {summary['requested']}")
-        for k, v in summary.items():
-            print(f"  {k}: {v}")
-        print(cost_summary_line("Pass 2:", stats.requested, stats.calls, stats.estimated_cost_usd))
+        print_stage_run_line(
+            "semantic-score",
+            date_from,
+            date_until,
+            candidates=stats.requested,
+            batches=stats.batches,
+            est_cost=stats.estimated_cost_usd,
+        )
         return stats
 
     if client is None:
@@ -1927,15 +1955,22 @@ def stage_semantic_score_v2(
 
     summary = stats.to_dict()
     summary["gate_percentile"] = gate_percentile
+    from research_radar.candidate_window import merge_window_summary, print_stage_run_line
+
+    summary = merge_window_summary(summary, date_from, date_until)
     conn.execute(
         "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
         (json.dumps({"semantic_score_v2_stats": summary}), run_id),
     )
     log.info("Quality v2 stats: %s", json.dumps(summary))
-    print("\nSEMANTIC SCORE V2 (PASS 2) SUMMARY")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
-    print(cost_summary_line("Pass 2:", stats.completed, stats.calls, stats.estimated_cost_usd))
+    print_stage_run_line(
+        "semantic-score",
+        date_from,
+        date_until,
+        candidates=stats.completed,
+        batches=stats.batches,
+        est_cost=stats.estimated_cost_usd,
+    )
     return stats
 
 
@@ -2269,8 +2304,8 @@ def stage_screen(
     limit: int | None = None,
     dry_run: bool = False,
     force: bool = False,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
     client=None,
 ):
     """
@@ -2282,15 +2317,15 @@ def stage_screen(
         require_scoring_enabled()
         require_api_key()
 
-    candidates = load_quality_candidates(conn, limit=limit, since=since, until=until)
+    candidates = load_quality_candidates(conn, limit=limit, date_from=date_from, date_until=date_until)
     if not force:
         candidates = [c for c in candidates if not screen_assessment_exists(conn, c["content_id"])]
 
     if not candidates:
-        from research_radar.candidate_window import merge_window_summary, print_empty_candidate_pool
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        print_empty_candidate_pool("SCREEN (PASS 1)", since, until)
-        summary = merge_window_summary({"requested": 0}, since, until)
+        print_stage_run_line("screen", date_from, date_until, candidates=0)
+        summary = merge_window_summary({"requested": 0}, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"screen_empty": summary}), run_id),
@@ -2309,20 +2344,22 @@ def stage_screen(
         stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
         stats.calls = len(batches)
         summary = stats.to_dict()
-        from research_radar.candidate_window import merge_window_summary
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        summary = merge_window_summary(summary, since, until)
+        summary = merge_window_summary(summary, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"screen_dry_run": summary}), run_id),
         )
         log.info("Screen DRY RUN: %s", json.dumps(summary))
-        print("\nSCREEN (PASS 1) DRY RUN")
-        print(f"  published_window: {summary['published_window']}")
-        print(f"  candidates: {summary['requested']}")
-        for k, v in summary.items():
-            print(f"  {k}: {v}")
-        print(cost_summary_line("Pass 1:", stats.requested, stats.calls, stats.estimated_cost_usd))
+        print_stage_run_line(
+            "screen",
+            date_from,
+            date_until,
+            candidates=stats.requested,
+            batches=stats.batches,
+            est_cost=stats.estimated_cost_usd,
+        )
         return stats
 
     if client is None:
@@ -2429,15 +2466,22 @@ def stage_screen(
             log.info("Screen (pass 1) batches progress %d/%d concurrency_ceiling=%d", done_batches, len(batches), gate.ceiling)
 
     summary = stats.to_dict()
+    from research_radar.candidate_window import merge_window_summary, print_stage_run_line
+
+    summary = merge_window_summary(summary, date_from, date_until)
     conn.execute(
         "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
         (json.dumps({"screen_stats": summary}), run_id),
     )
     log.info("Screen stats: %s", json.dumps(summary))
-    print("\nSCREEN (PASS 1) SUMMARY")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
-    print(cost_summary_line("Pass 1:", stats.completed, stats.calls, stats.estimated_cost_usd))
+    print_stage_run_line(
+        "screen",
+        date_from,
+        date_until,
+        candidates=stats.completed,
+        batches=stats.batches,
+        est_cost=stats.estimated_cost_usd,
+    )
     return stats
 
 

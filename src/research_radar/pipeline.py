@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
 
@@ -2136,7 +2136,6 @@ def print_top_candidates(top=10):
 
 
 PAID_STAGES = frozenset({"affiliation-gpt", "classify", "screen", "independence", "semantic-score", "topics"})
-SCORING_DATE_STAGES = frozenset({"classify", "screen", "semantic-score", "independence", "topics"})
 
 
 class PaidStageNotAuthorised(RuntimeError):
@@ -2161,8 +2160,6 @@ def run_stage(
     gate_percentile=None,
     date_from=None,
     date_until=None,
-    published_since: date | str | None = None,
-    published_until: date | str | None = None,
     reprocess_version: str | None = None,
 ):
     if stage in PAID_STAGES and not dry_run and not allow_paid:
@@ -2213,8 +2210,8 @@ def run_stage(
                     limit=limit,
                     dry_run=dry_run,
                     force=force,
-                    since=published_since,
-                    until=published_until,
+                    date_from=date_from,
+                    date_until=date_until,
                 )
             elif stage == "screen":
                 from research_radar.semantic_scoring import stage_screen
@@ -2225,8 +2222,8 @@ def run_stage(
                     limit=limit,
                     dry_run=dry_run,
                     force=force,
-                    since=published_since,
-                    until=published_until,
+                    date_from=date_from,
+                    date_until=date_until,
                 )
             elif stage == "semantic-score":
                 from research_radar.semantic_scoring import stage_semantic_score_v2
@@ -2239,8 +2236,8 @@ def run_stage(
                     dry_run=dry_run,
                     force=force,
                     gate_percentile=gate_percentile,
-                    since=published_since,
-                    until=published_until,
+                    date_from=date_from,
+                    date_until=date_until,
                 )
             elif stage == "independence":
                 from research_radar.independence import stage_independence
@@ -2251,8 +2248,8 @@ def run_stage(
                     limit=limit,
                     dry_run=dry_run,
                     force=force,
-                    since=published_since,
-                    until=published_until,
+                    date_from=date_from,
+                    date_until=date_until,
                 )
             elif stage == "topics":
                 # Annotation stage, NOT scoring — runs on every RELEVANT-or-
@@ -2266,8 +2263,8 @@ def run_stage(
                     limit=limit,
                     dry_run=dry_run,
                     force=force,
-                    since=published_since,
-                    until=published_until,
+                    date_from=date_from,
+                    date_until=date_until,
                 )
             elif stage == "semantic-compare":
                 from research_radar.semantic_scoring import print_semantic_compare
@@ -2467,14 +2464,16 @@ def main():
         dest="date_from",
         type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
         default=None,
-        help="arxiv-backfill: start date (inclusive), ISO YYYY-MM-DD",
+        help="arxiv-backfill: harvest start date (inclusive, on record datestamp); "
+        "paid scoring stages: published_at lower bound (inclusive), ISO YYYY-MM-DD",
     )
     ap.add_argument(
         "--until",
         dest="date_until",
         type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
         default=None,
-        help="arxiv-backfill or paid scoring stages: end date (inclusive), ISO YYYY-MM-DD",
+        help="arxiv-backfill: harvest end date (inclusive, on record datestamp); "
+        "paid scoring stages: published_at upper bound (inclusive of whole day), ISO YYYY-MM-DD",
     )
     ap.add_argument("--tag", default=None, help="corpus-search: filter by level-3 topic (canonical name or alias)")
     ap.add_argument("--subdomain", default=None, help="corpus-search: filter by subdomain")
@@ -2482,13 +2481,7 @@ def main():
     ap.add_argument("--domain", default=None, help="corpus-search: filter by domain")
     ap.add_argument("--paper-kind", default=None, help="corpus-search: filter by independence paper_kind")
     ap.add_argument("--with-claims", action="store_true", help="corpus-search: only papers with extracted claims, and include them in output")
-    ap.add_argument(
-        "--since",
-        default=None,
-        help="corpus-search: ISO date/datetime lower bound for published_at; "
-        "paid scoring stages (classify/screen/semantic-score/independence/topics): "
-        "ISO YYYY-MM-DD lower bound (inclusive)",
-    )
+    ap.add_argument("--since", default=None, help="corpus-search: ISO date/datetime lower bound for published_at")
     ap.add_argument("--list-topics", action="store_true", help="corpus-search: print the tag vocabulary with usage counts")
     ap.add_argument("--min-usage", type=int, default=None, help="corpus-search --list-topics: only topics with usage_count >= N")
     ap.add_argument("--claims-for", default=None, help="corpus-search: list claims for a given metric name, ranked by value_num")
@@ -2529,13 +2522,6 @@ def main():
     if args.stage == "semantic-score" and args.full is False and args.sample is None:
         args.sample = 100
 
-    published_since = None
-    published_until = None
-    if args.stage in SCORING_DATE_STAGES:
-        if args.since:
-            published_since = datetime.strptime(args.since, "%Y-%m-%d").date()
-        published_until = args.date_until
-
     run_id = run_stage(
         args.stage,
         limit=args.limit,
@@ -2553,8 +2539,6 @@ def main():
         gate_percentile=args.gate_percentile,
         date_from=args.date_from,
         date_until=args.date_until,
-        published_since=published_since,
-        published_until=published_until,
         reprocess_version=args.reprocess_version,
     )
     print(f"\nSTAGE COMPLETED: {args.stage} run_id={run_id}")

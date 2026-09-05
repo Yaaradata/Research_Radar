@@ -527,12 +527,12 @@ def load_topics_candidates(
     conn,
     limit: int | None = None,
     *,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
 ) -> list[dict]:
     from research_radar.candidate_window import published_at_sql_filters
 
-    window_sql, window_params = published_at_sql_filters(since, until)
+    window_sql, window_params = published_at_sql_filters(date_from, date_until)
     rows = conn.execute(
         f"""
         SELECT
@@ -768,8 +768,8 @@ def stage_topics(
     limit: int | None = None,
     dry_run: bool = False,
     force: bool = False,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
     client=None,
 ):
     vocab = load_topic_vocabulary(conn)
@@ -780,7 +780,7 @@ def stage_topics(
         )
     vocab_block = build_vocabulary_block(vocab)
 
-    candidates = load_topics_candidates(conn, limit=limit, since=since, until=until)
+    candidates = load_topics_candidates(conn, limit=limit, date_from=date_from, date_until=date_until)
     if not force:
         eligible = [c for c in candidates if not topics_assessment_exists(conn, c["content_id"])]
         skipped = len(candidates) - len(eligible)
@@ -789,10 +789,10 @@ def stage_topics(
         skipped = 0
 
     if not candidates:
-        from research_radar.candidate_window import merge_window_summary, print_empty_candidate_pool
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        print_empty_candidate_pool("TOPICS", since, until)
-        summary = merge_window_summary({"requested": 0, "skipped_existing": skipped}, since, until)
+        print_stage_run_line("topics", date_from, date_until, candidates=0)
+        summary = merge_window_summary({"requested": 0, "skipped_existing": skipped}, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"topics_empty": summary}), run_id),
@@ -814,20 +814,22 @@ def stage_topics(
         stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
         stats.calls = len(batches)
         summary = stats.to_dict()
-        from research_radar.candidate_window import merge_window_summary
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        summary = merge_window_summary(summary, since, until)
+        summary = merge_window_summary(summary, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"topics_dry_run": summary}), run_id),
         )
         log.info("Topics DRY RUN: %s", json.dumps(summary))
-        print("\nTOPICS DRY RUN")
-        print(f"  published_window: {summary['published_window']}")
-        print(f"  candidates: {summary['requested']}")
-        for k, v in summary.items():
-            print(f"  {k}: {v}")
-        print(cost_summary_line("Topics:", stats.requested, stats.calls, stats.estimated_cost_usd))
+        print_stage_run_line(
+            "topics",
+            date_from,
+            date_until,
+            candidates=stats.requested,
+            batches=stats.batches,
+            est_cost=stats.estimated_cost_usd,
+        )
         return stats
 
     if client is None:
@@ -920,13 +922,20 @@ def stage_topics(
             log.info("Topics batches progress %d/%d concurrency_ceiling=%d", done_batches, len(batches), gate.ceiling)
 
     summary = stats.to_dict()
+    from research_radar.candidate_window import merge_window_summary, print_stage_run_line
+
+    summary = merge_window_summary(summary, date_from, date_until)
     conn.execute(
         "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
         (json.dumps({"topics_stats": summary}), run_id),
     )
     log.info("Topics stats: %s", json.dumps(summary))
-    print("\nTOPICS SUMMARY")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
-    print(cost_summary_line("Topics:", stats.completed, stats.calls, stats.estimated_cost_usd))
+    print_stage_run_line(
+        "topics",
+        date_from,
+        date_until,
+        candidates=stats.completed,
+        batches=stats.batches,
+        est_cost=stats.estimated_cost_usd,
+    )
     return stats

@@ -384,8 +384,8 @@ def stage_classify(
     limit: int | None = None,
     dry_run: bool = False,
     force: bool = False,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
     client=None,
 ):
     """Classify every eligible paper before the screen gate."""
@@ -393,15 +393,15 @@ def stage_classify(
         require_scoring_enabled()
         require_api_key()
 
-    candidates = load_quality_candidates(conn, limit=limit, since=since, until=until)
+    candidates = load_quality_candidates(conn, limit=limit, date_from=date_from, date_until=date_until)
     if not force:
         candidates = [c for c in candidates if not classification_exists(conn, c["content_id"])]
 
     if not candidates:
-        from research_radar.candidate_window import merge_window_summary, print_empty_candidate_pool
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        print_empty_candidate_pool("CLASSIFY", since, until)
-        summary = merge_window_summary({"requested": 0}, since, until)
+        print_stage_run_line("classify", date_from, date_until, candidates=0)
+        summary = merge_window_summary({"requested": 0}, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"classify_empty": summary}), run_id),
@@ -420,20 +420,22 @@ def stage_classify(
         stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
         stats.calls = len(batches)
         summary = stats.to_dict()
-        from research_radar.candidate_window import merge_window_summary
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        summary = merge_window_summary(summary, since, until)
+        summary = merge_window_summary(summary, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"classify_dry_run": summary}), run_id),
         )
         log.info("Classify DRY RUN: %s", json.dumps(summary))
-        print("\nCLASSIFY DRY RUN")
-        print(f"  published_window: {summary['published_window']}")
-        print(f"  candidates: {summary['requested']}")
-        for k, v in summary.items():
-            print(f"  {k}: {v}")
-        print(cost_summary_line("Classify:", stats.requested, stats.calls, stats.estimated_cost_usd))
+        print_stage_run_line(
+            "classify",
+            date_from,
+            date_until,
+            candidates=stats.requested,
+            batches=stats.batches,
+            est_cost=stats.estimated_cost_usd,
+        )
         return stats
 
     if client is None:
@@ -519,13 +521,20 @@ def stage_classify(
             log.info("Classify batches progress %d/%d concurrency_ceiling=%d", done_batches, len(batches), gate.ceiling)
 
     summary = stats.to_dict()
+    from research_radar.candidate_window import merge_window_summary, print_stage_run_line
+
+    summary = merge_window_summary(summary, date_from, date_until)
     conn.execute(
         "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
         (json.dumps({"classify_stats": summary}), run_id),
     )
     log.info("Classify stats: %s", json.dumps(summary))
-    print("\nCLASSIFY SUMMARY")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
-    print(cost_summary_line("Classify:", stats.completed, stats.calls, stats.estimated_cost_usd))
+    print_stage_run_line(
+        "classify",
+        date_from,
+        date_until,
+        candidates=stats.completed,
+        batches=stats.batches,
+        est_cost=stats.estimated_cost_usd,
+    )
     return stats

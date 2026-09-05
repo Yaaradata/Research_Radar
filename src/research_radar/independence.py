@@ -381,8 +381,8 @@ def load_independence_candidates(
     conn,
     limit: int | None = None,
     *,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
 ) -> list[dict]:
     """
     Papers with a COMPLETED pass-2 ("full") quality assessment, affiliation_text
@@ -391,11 +391,11 @@ def load_independence_candidates(
     never rank is wasted spend. This replaced the earlier
     ENTITY_RESOLVED/SCORED/CANDIDATE status filter, which predates tiering.
 
-    Optional ``since`` / ``until`` bound ``ci.published_at`` (until is inclusive).
+    Optional ``date_from`` / ``date_until`` bound ``ci.published_at`` (until inclusive).
     """
     from research_radar.candidate_window import published_at_sql_filters
 
-    window_sql, window_params = published_at_sql_filters(since, until)
+    window_sql, window_params = published_at_sql_filters(date_from, date_until)
     rows = conn.execute(
         f"""
         SELECT
@@ -430,21 +430,21 @@ def stage_independence(
     limit: int | None = None,
     dry_run: bool = False,
     force: bool = False,
-    since: date | str | None = None,
-    until: date | str | None = None,
+    date_from: date | str | None = None,
+    date_until: date | str | None = None,
     client=None,
 ):
     from research_radar.pipeline import bump, event
 
-    candidates = load_independence_candidates(conn, limit=limit, since=since, until=until)
+    candidates = load_independence_candidates(conn, limit=limit, date_from=date_from, date_until=date_until)
     if not force:
         candidates = [c for c in candidates if not independence_assessment_exists(conn, c["content_id"])]
 
     if not candidates:
-        from research_radar.candidate_window import merge_window_summary, print_empty_candidate_pool
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        print_empty_candidate_pool("INDEPENDENCE", since, until)
-        summary = merge_window_summary({"requested": 0}, since, until)
+        print_stage_run_line("independence", date_from, date_until, candidates=0)
+        summary = merge_window_summary({"requested": 0}, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"independence_empty": summary}), run_id),
@@ -463,20 +463,22 @@ def stage_independence(
         stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
         stats.calls = len(batches)
         summary = stats.to_dict()
-        from research_radar.candidate_window import merge_window_summary
+        from research_radar.candidate_window import merge_window_summary, print_stage_run_line
 
-        summary = merge_window_summary(summary, since, until)
+        summary = merge_window_summary(summary, date_from, date_until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"independence_dry_run": summary}), run_id),
         )
         log.info("Independence DRY RUN: %s", json.dumps(summary))
-        print("\nINDEPENDENCE DRY RUN")
-        print(f"  published_window: {summary['published_window']}")
-        print(f"  candidates: {summary['requested']}")
-        for k, v in summary.items():
-            print(f"  {k}: {v}")
-        print(cost_summary_line("Independence:", stats.requested, stats.calls, stats.estimated_cost_usd))
+        print_stage_run_line(
+            "independence",
+            date_from,
+            date_until,
+            candidates=stats.requested,
+            batches=stats.batches,
+            est_cost=stats.estimated_cost_usd,
+        )
         return stats
 
     if not OPENROUTER_API_KEY:
@@ -613,13 +615,20 @@ def stage_independence(
             log.info("Independence batches progress %d/%d concurrency_ceiling=%d", done_batches, len(batches), gate.ceiling)
 
     summary = stats.to_dict()
+    from research_radar.candidate_window import merge_window_summary, print_stage_run_line
+
+    summary = merge_window_summary(summary, date_from, date_until)
     conn.execute(
         "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
         (json.dumps({"independence_stats": summary}), run_id),
     )
     log.info("Independence stats: %s", json.dumps(summary))
-    print("\nINDEPENDENCE SUMMARY")
-    for k, v in summary.items():
-        print(f"  {k}: {v}")
-    print(cost_summary_line("Independence:", stats.completed, stats.calls, stats.estimated_cost_usd))
+    print_stage_run_line(
+        "independence",
+        date_from,
+        date_until,
+        candidates=stats.completed,
+        batches=stats.batches,
+        est_cost=stats.estimated_cost_usd,
+    )
     return stats

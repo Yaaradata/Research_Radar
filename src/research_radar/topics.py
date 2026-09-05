@@ -28,6 +28,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import date
 
 from research_radar.llm_batch import (
     AdaptiveConcurrencyGate,
@@ -522,7 +523,16 @@ def upsert_topics_assessment(conn, *, content_id: int, status: str, tokens_in=No
     )
 
 
-def load_topics_candidates(conn, limit: int | None = None) -> list[dict]:
+def load_topics_candidates(
+    conn,
+    limit: int | None = None,
+    *,
+    since: date | str | None = None,
+    until: date | str | None = None,
+) -> list[dict]:
+    from research_radar.candidate_window import published_at_sql_filters
+
+    window_sql, window_params = published_at_sql_filters(since, until)
     rows = conn.execute(
         f"""
         SELECT
@@ -533,10 +543,11 @@ def load_topics_candidates(conn, limit: int | None = None) -> list[dict]:
         FROM research_radar.content_items ci
         LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
         WHERE ci.status IN ({', '.join(['%s'] * len(TOPICS_ELIGIBLE_STATUSES))})
+        {window_sql}
         ORDER BY ci.id
         LIMIT %s
         """,
-        (*TOPICS_ELIGIBLE_STATUSES, limit or 200_000),
+        (*TOPICS_ELIGIBLE_STATUSES, *window_params, limit or 200_000),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -750,7 +761,17 @@ def estimate_topics_prompt_tokens(papers: list[dict], vocab_block: str) -> int:
     return max(1, len(prompt) // 4)
 
 
-def stage_topics(conn, run_id, *, limit: int | None = None, dry_run: bool = False, force: bool = False, client=None):
+def stage_topics(
+    conn,
+    run_id,
+    *,
+    limit: int | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+    since: date | str | None = None,
+    until: date | str | None = None,
+    client=None,
+):
     vocab = load_topic_vocabulary(conn)
     if not vocab["domains_list"]:
         raise RuntimeError(
@@ -759,13 +780,24 @@ def stage_topics(conn, run_id, *, limit: int | None = None, dry_run: bool = Fals
         )
     vocab_block = build_vocabulary_block(vocab)
 
-    candidates = load_topics_candidates(conn, limit=limit)
+    candidates = load_topics_candidates(conn, limit=limit, since=since, until=until)
     if not force:
         eligible = [c for c in candidates if not topics_assessment_exists(conn, c["content_id"])]
         skipped = len(candidates) - len(eligible)
         candidates = eligible
     else:
         skipped = 0
+
+    if not candidates:
+        from research_radar.candidate_window import merge_window_summary, print_empty_candidate_pool
+
+        print_empty_candidate_pool("TOPICS", since, until)
+        summary = merge_window_summary({"requested": 0, "skipped_existing": skipped}, since, until)
+        conn.execute(
+            "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
+            (json.dumps({"topics_empty": summary}), run_id),
+        )
+        return TopicsRunStats(requested=0, skipped_existing=skipped)
 
     stats = TopicsRunStats(requested=len(candidates), skipped_existing=skipped)
     batches = random_batches(candidates, TOPICS_BATCH_SIZE)
@@ -782,12 +814,17 @@ def stage_topics(conn, run_id, *, limit: int | None = None, dry_run: bool = Fals
         stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
         stats.calls = len(batches)
         summary = stats.to_dict()
+        from research_radar.candidate_window import merge_window_summary
+
+        summary = merge_window_summary(summary, since, until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"topics_dry_run": summary}), run_id),
         )
         log.info("Topics DRY RUN: %s", json.dumps(summary))
         print("\nTOPICS DRY RUN")
+        print(f"  published_window: {summary['published_window']}")
+        print(f"  candidates: {summary['requested']}")
         for k, v in summary.items():
             print(f"  {k}: {v}")
         print(cost_summary_line("Topics:", stats.requested, stats.calls, stats.estimated_cost_usd))

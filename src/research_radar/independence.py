@@ -20,6 +20,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import date
 
 from research_radar.llm_batch import (
     AdaptiveConcurrencyGate,
@@ -376,16 +377,27 @@ def upsert_independence_assessment(
     )
 
 
-def load_independence_candidates(conn, limit: int | None = None) -> list[dict]:
+def load_independence_candidates(
+    conn,
+    limit: int | None = None,
+    *,
+    since: date | str | None = None,
+    until: date | str | None = None,
+) -> list[dict]:
     """
     Papers with a COMPLETED pass-2 ("full") quality assessment, affiliation_text
     only — never content_organisations. Independence now runs ONLY on pass-2
     papers (tiering brief §1): classifying a paper that screened out and will
     never rank is wasted spend. This replaced the earlier
     ENTITY_RESOLVED/SCORED/CANDIDATE status filter, which predates tiering.
+
+    Optional ``since`` / ``until`` bound ``ci.published_at`` (until is inclusive).
     """
+    from research_radar.candidate_window import published_at_sql_filters
+
+    window_sql, window_params = published_at_sql_filters(since, until)
     rows = conn.execute(
-        """
+        f"""
         SELECT
             ci.id AS content_id,
             ci.title,
@@ -397,10 +409,11 @@ def load_independence_candidates(conn, limit: int | None = None) -> list[dict]:
         WHERE a.prompt_version = %s
           AND a.scoring_tier = 'full'
           AND a.status = 'COMPLETED'
+        {window_sql}
         ORDER BY ci.id
         LIMIT %s
         """,
-        (QUALITY_PROMPT_VERSION, limit or 10_000),
+        (QUALITY_PROMPT_VERSION, *window_params, limit or 10_000),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -417,13 +430,26 @@ def stage_independence(
     limit: int | None = None,
     dry_run: bool = False,
     force: bool = False,
+    since: date | str | None = None,
+    until: date | str | None = None,
     client=None,
 ):
     from research_radar.pipeline import bump, event
 
-    candidates = load_independence_candidates(conn, limit=limit)
+    candidates = load_independence_candidates(conn, limit=limit, since=since, until=until)
     if not force:
         candidates = [c for c in candidates if not independence_assessment_exists(conn, c["content_id"])]
+
+    if not candidates:
+        from research_radar.candidate_window import merge_window_summary, print_empty_candidate_pool
+
+        print_empty_candidate_pool("INDEPENDENCE", since, until)
+        summary = merge_window_summary({"requested": 0}, since, until)
+        conn.execute(
+            "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
+            (json.dumps({"independence_empty": summary}), run_id),
+        )
+        return IndependenceRunStats(requested=0)
 
     stats = IndependenceRunStats(requested=len(candidates))
     batches = random_batches(candidates, INDEPENDENCE_BATCH_SIZE)
@@ -437,12 +463,17 @@ def stage_independence(
         stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
         stats.calls = len(batches)
         summary = stats.to_dict()
+        from research_radar.candidate_window import merge_window_summary
+
+        summary = merge_window_summary(summary, since, until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"independence_dry_run": summary}), run_id),
         )
         log.info("Independence DRY RUN: %s", json.dumps(summary))
         print("\nINDEPENDENCE DRY RUN")
+        print(f"  published_window: {summary['published_window']}")
+        print(f"  candidates: {summary['requested']}")
         for k, v in summary.items():
             print(f"  {k}: {v}")
         print(cost_summary_line("Independence:", stats.requested, stats.calls, stats.estimated_cost_usd))

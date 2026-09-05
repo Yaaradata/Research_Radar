@@ -52,9 +52,13 @@ Stages (run in this order):
   5) affiliation-gpt   GPT evidence-only affiliation resolver (PAID — needs --allow-paid)
   5b) openalex   DEPRECATED legacy Crossref/OpenAlex (inactive unless explicitly enabled)
   6) classify    Scoring v3 — domain/audience/paper_kind on full eligible pool (PAID — needs --allow-paid)
+                 Optional --since/--until (ISO YYYY-MM-DD) bound ci.published_at; --until is inclusive.
   7) screen      Scoring v2 pass 1 — cheap screen gate (PAID — needs --allow-paid)
+                 Optional --since/--until (ISO YYYY-MM-DD) bound ci.published_at; --until is inclusive.
   8) semantic-score   GPT full rubric pass 2 (PAID — needs --allow-paid)
+                 Optional --since/--until (ISO YYYY-MM-DD) bound ci.published_at; --until is inclusive.
   9) independence     Categorical independence + paper_kind (PAID — needs --allow-paid)
+                 Optional --since/--until (ISO YYYY-MM-DD) bound ci.published_at; --until is inclusive.
  10) semantic-compare Compare deterministic vs GPT semantic ranks (explicit)
  11) final-score      Recompute ranking from stored assessments + org/person boosts (FREE)
  12) report           Markdown Top N from content_final_scores (FREE)
@@ -66,6 +70,8 @@ Stages (run in this order):
                  --allow-paid). Annotation only, NOT scoring: runs on every
                  RELEVANT-or-later paper, never changes content_items.status,
                  not in `all`. --dry-run projects cost with zero calls/writes.
+                 Optional --since/--until (ISO YYYY-MM-DD) bound ci.published_at;
+                 --until is inclusive.
  14) corpus-search     Free, pure-SQL query over topics/claims (FREE, explicit,
                  not in `all`). --tag/--subdomain/--application/--domain/--since
                  filter (AND); --list-topics audits the tag vocabulary;
@@ -88,6 +94,8 @@ Examples:
   AFFILIATION_GPT_ENABLED=true ./scripts/run_stage.sh affiliation-gpt --limit 50 --allow-paid
   ./scripts/run_stage.sh score
   ./scripts/run_stage.sh semantic-score --sample 100 --dry-run
+  ./scripts/run_stage.sh screen --since 2026-09-04 --until 2026-09-04 --dry-run
+  ./scripts/run_stage.sh classify --since 2026-09-04 --until 2026-09-05 --dry-run
   SEMANTIC_SCORING_ENABLED=true ./scripts/run_stage.sh semantic-score --sample 100 --allow-paid
   ./scripts/run_stage.sh semantic-compare
   ./scripts/run_stage.sh final-score --diagnose

@@ -13,6 +13,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import date
 
 from research_radar.classification_vocab import (
     APPLICATION_DOMAINS,
@@ -383,6 +384,8 @@ def stage_classify(
     limit: int | None = None,
     dry_run: bool = False,
     force: bool = False,
+    since: date | str | None = None,
+    until: date | str | None = None,
     client=None,
 ):
     """Classify every eligible paper before the screen gate."""
@@ -390,9 +393,20 @@ def stage_classify(
         require_scoring_enabled()
         require_api_key()
 
-    candidates = load_quality_candidates(conn, limit=limit)
+    candidates = load_quality_candidates(conn, limit=limit, since=since, until=until)
     if not force:
         candidates = [c for c in candidates if not classification_exists(conn, c["content_id"])]
+
+    if not candidates:
+        from research_radar.candidate_window import merge_window_summary, print_empty_candidate_pool
+
+        print_empty_candidate_pool("CLASSIFY", since, until)
+        summary = merge_window_summary({"requested": 0}, since, until)
+        conn.execute(
+            "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
+            (json.dumps({"classify_empty": summary}), run_id),
+        )
+        return ClassifyRunStats(requested=0)
 
     stats = ClassifyRunStats(requested=len(candidates))
     batches = random_batches(candidates, CLASSIFY_BATCH_SIZE)
@@ -406,12 +420,17 @@ def stage_classify(
         stats.estimated_cost_usd = estimate_cost_usd(est_in, est_out)
         stats.calls = len(batches)
         summary = stats.to_dict()
+        from research_radar.candidate_window import merge_window_summary
+
+        summary = merge_window_summary(summary, since, until)
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET notes = notes || %s::jsonb WHERE run_id = %s",
             (json.dumps({"classify_dry_run": summary}), run_id),
         )
         log.info("Classify DRY RUN: %s", json.dumps(summary))
         print("\nCLASSIFY DRY RUN")
+        print(f"  published_window: {summary['published_window']}")
+        print(f"  candidates: {summary['requested']}")
         for k, v in summary.items():
             print(f"  {k}: {v}")
         print(cost_summary_line("Classify:", stats.requested, stats.calls, stats.estimated_cost_usd))

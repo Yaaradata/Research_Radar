@@ -220,6 +220,26 @@ def test_missing_paper_triggers_individual_retry_not_silent_loss():
 
 
 # ---------------------------------------------------------------------------
+# Scoring v3: prompts must not gate-collapse other dimensions when ai_relevance
+# is low — the code gate handles drops; stored scores stay honest measurements.
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_versions_default_to_v3():
+    assert ss.SCREEN_PROMPT_VERSION == "research-screen-v3"
+    assert ss.QUALITY_PROMPT_VERSION == "research-semantic-v3"
+
+
+def test_gate_prompt_does_not_collapse_other_dimensions():
+    gate_collapse = "score every other dimension at 3 or below"
+    assert gate_collapse not in ss.QUALITY_SYSTEM_PROMPT
+    assert gate_collapse not in ss.SCREEN_SYSTEM_PROMPT
+    for prompt in (ss.QUALITY_SYSTEM_PROMPT, ss.SCREEN_SYSTEM_PROMPT):
+        assert "Do NOT lower other dimensions because ai_relevance is low" in prompt
+        assert "must remain a real measurement" in prompt
+
+
+# ---------------------------------------------------------------------------
 # Tiering: pass 1 (screen) is cheap, prose-free and reasoning-disabled.
 # ---------------------------------------------------------------------------
 

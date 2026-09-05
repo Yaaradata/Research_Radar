@@ -1087,7 +1087,7 @@ def print_semantic_compare(conn, *, limit: int = 20, prompt_version: str | None 
 # ===========================================================================
 
 QUALITY_PROMPT_VERSION = (
-    os.getenv("QUALITY_PROMPT_VERSION", "research-semantic-v2").strip() or "research-semantic-v2"
+    os.getenv("QUALITY_PROMPT_VERSION", "research-semantic-v3").strip() or "research-semantic-v3"
 )
 QUALITY_BATCH_SIZE = int(os.getenv("QUALITY_BATCH_SIZE", "5"))
 QUALITY_REASONING_EFFORT = os.getenv("QUALITY_REASONING_EFFORT", "medium").strip() or "medium"
@@ -1107,7 +1107,7 @@ GATE_PERCENTILE = float(os.getenv("GATE_PERCENTILE", "15"))
 # can reference SCREEN_PROMPT_VERSION without a forward-reference.
 SCREEN_MODEL = os.getenv("SCREEN_MODEL", "anthropic/claude-haiku-4.5").strip() or "anthropic/claude-haiku-4.5"
 SCREEN_PROMPT_VERSION = (
-    os.getenv("SCREEN_PROMPT_VERSION", "research-screen-v2").strip() or "research-screen-v2"
+    os.getenv("SCREEN_PROMPT_VERSION", "research-screen-v3").strip() or "research-screen-v3"
 )
 SCREEN_BATCH_SIZE = int(os.getenv("SCREEN_BATCH_SIZE", "15"))
 SCREEN_MAX_RETRIES = int(os.getenv("SCREEN_MAX_RETRIES", "3"))
@@ -1173,9 +1173,10 @@ Judge each paper on its own merits against the absolute scale below. Do NOT
 score papers relative to the others in this batch. A batch of weak papers
 does not make the least weak one strong.
 
-GATE: Score ai_relevance first. If ai_relevance is 3 or below, the paper is
-off-topic for this system - score every other dimension at 3 or below
-regardless of how rigorous the work is.
+GATE: Score ai_relevance first, then score every other dimension honestly on its own
+merits. Do NOT lower other dimensions because ai_relevance is low - an off-topic paper
+can still be rigorous, and the system drops off-topic papers separately. Each dimension
+must remain a real measurement.
 
 SCALE
 
@@ -1621,7 +1622,8 @@ def load_quality_candidates(conn, limit: int | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-# Matches the GATE wording in both system prompts ("ai_relevance is 3 or below").
+# Code gate: screen rows with ai_relevance <= 3 never reach pass 2 (prompt no longer
+# collapses other dimensions when ai_relevance is low).
 SCREEN_AI_RELEVANCE_FLOOR = 3.0
 
 
@@ -1898,7 +1900,7 @@ def stage_semantic_score_v2(
 # Same architectural guarantee as pass 2: title+categories+abstract only,
 # never affiliation (build_quality_paper_block is reused verbatim). Writes to
 # the SAME content_score_assessments table as pass 2, distinguished by
-# prompt_version='research-screen-v2' and scoring_tier='screen'.
+# prompt_version=SCREEN_PROMPT_VERSION and scoring_tier='screen'.
 # ===========================================================================
 
 SCREEN_NUMERIC_FIELDS = ["ai_relevance", "technical_significance", "apparent_novelty", "evidence_strength"]
@@ -1913,7 +1915,7 @@ def _extract_gate_and_scale(system_prompt: str) -> str:
     """Pull the GATE + SCALE sections out of QUALITY_SYSTEM_PROMPT verbatim —
     by slicing the shared source text rather than retyping it, the two
     prompts' anchors cannot drift apart (brief §1: "same absolute anchors")."""
-    start = system_prompt.index("GATE: Score ai_relevance first.")
+    start = system_prompt.index("GATE: Score ai_relevance first,")
     end = system_prompt.index("\n\nDIMENSIONS", start)
     return system_prompt[start:end].strip()
 

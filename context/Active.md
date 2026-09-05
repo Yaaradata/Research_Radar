@@ -21,8 +21,8 @@ TBD — create `cursor/scoring-v3-*-bbc7` per change.
 
 ## Scoring v3 queue (one change at a time)
 
-1. **NEXT:** Remove gate-collapse instruction from screen + quality prompts
-2. Drop `ai_relevance` from screen ranking mean in `select_gated_content_ids()`
+1. ~~Remove gate-collapse instruction from screen + quality prompts~~ **DONE** (`cursor/scoring-v3-gate-prompt-bbc7`, verifier PASS)
+2. **NEXT:** Drop `ai_relevance` from screen ranking mean in `select_gated_content_ids()`
 3. Independence prompt emits `paper_kind`
 4. Migration `content_classifications` + new `classify` stage
 

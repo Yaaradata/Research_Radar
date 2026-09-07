@@ -222,5 +222,5 @@ def test_estimate_bakeoff_cost_three_candidates_two_passes():
 def test_load_config_matches_spec_candidates():
     config = load_bakeoff_config()
     ids = {c.id for c in config.candidates}
-    assert ids == {"haiku", "gpt-4o-mini", "glm-flash", "gemini-flash"}
+    assert ids == {"haiku", "gpt-4o-mini", "gemini-flash", "qwen-max"}
     assert config.batch_size == 15

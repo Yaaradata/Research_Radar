@@ -56,6 +56,26 @@ STRATUM_TARGETS = {
 }
 
 
+def scaled_stratum_targets(sample_size: int) -> dict[str, int]:
+    """Scale the default 400-paper strata to a smaller (or larger) sample size."""
+    base_total = sum(STRATUM_TARGETS.values())
+    if sample_size <= 0:
+        raise ValueError(f"sample_size must be positive, got {sample_size}")
+    if sample_size == base_total:
+        return dict(STRATUM_TARGETS)
+    # Largest-remainder so targets always sum to sample_size.
+    raw = {k: (v * sample_size) / base_total for k, v in STRATUM_TARGETS.items()}
+    floors = {k: int(v) for k, v in raw.items()}
+    remainders = sorted(
+        ((raw[k] - floors[k], k) for k in floors),
+        reverse=True,
+    )
+    out = dict(floors)
+    for i in range(sample_size - sum(floors.values())):
+        out[remainders[i % len(remainders)][1]] += 1
+    return out
+
+
 @dataclass
 class BakeoffCandidate:
     id: str

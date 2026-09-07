@@ -19,6 +19,7 @@ from research_radar.bakeoff import (  # noqa: E402
     load_bakeoff_config,
     new_run_id,
     persist_bakeoff_run,
+    scaled_stratum_targets,
     select_stratified_sample,
 )
 from research_radar.pipeline import connect
@@ -28,24 +29,34 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Create stratified bake-off sample and import Haiku baseline")
     parser.add_argument("--seed", type=int, default=None, help="Override sample seed from config")
     parser.add_argument("--run-id", type=str, default=None, help="Specify run UUID")
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Override sample size from config (scales stratum targets; default 400)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print counts only; do not write DB")
     args = parser.parse_args()
 
     config = load_bakeoff_config()
     seed = args.seed if args.seed is not None else config.sample_seed
+    sample_size = args.sample_size if args.sample_size is not None else config.sample_size
+    targets = scaled_stratum_targets(sample_size)
     run_id = UUID(args.run_id) if args.run_id else new_run_id()
 
     with connect() as conn:
         pool = load_baseline_classified_papers(conn, config)
-        sample, counts = select_stratified_sample(pool, seed=seed)
+        sample, counts = select_stratified_sample(pool, seed=seed, targets=targets)
         total = len(sample)
         print(f"Baseline pool ({config.baseline_date_from}..{config.baseline_date_until}): {len(pool)}")
         print(f"Sample seed: {seed}")
+        print(f"Sample size target: {sample_size}")
+        print(f"Stratum targets: {json.dumps(targets)}")
         print(f"Stratum counts: {json.dumps(counts)}")
         print(f"Total selected: {total}")
-        if total < config.sample_size:
+        if total < sample_size:
             print(
-                f"WARNING: target {config.sample_size} but only {total} papers sampled",
+                f"WARNING: target {sample_size} but only {total} papers sampled",
                 file=sys.stderr,
             )
         if args.dry_run:

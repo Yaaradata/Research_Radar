@@ -82,18 +82,37 @@ def main() -> int:
     parser.add_argument("--allow-paid", action="store_true", help="Authorise paid OpenRouter calls")
     parser.add_argument("--passes", type=int, default=2, help="Passes per candidate (default 2)")
     parser.add_argument("--estimate-only", action="store_true", help="Print cost estimate and exit")
+    parser.add_argument(
+        "--candidates",
+        default="",
+        help="Comma-separated candidate ids to run (default: all non-baseline)",
+    )
     args = parser.parse_args()
 
     config = load_bakeoff_config()
     run_id = UUID(args.run_id)
-    resolved = _verify_models(config)
+    only_ids = {x.strip() for x in args.candidates.split(",") if x.strip()}
+    if only_ids:
+        unknown = only_ids - {c.id for c in config.candidates}
+        if unknown:
+            print(f"Unknown candidate id(s): {sorted(unknown)}", file=sys.stderr)
+            return 1
+        selected = [c for c in config.candidates if c.id in only_ids]
+    else:
+        selected = [c for c in config.candidates if c.id != config.baseline_candidate_id]
+
+    # Restrict config view for estimate / model check to selected challengers.
+    from dataclasses import replace
+
+    estimate_config = replace(config, candidates=[c for c in config.candidates if c.id == config.baseline_candidate_id or c in selected])
+    resolved = _verify_models(estimate_config)
 
     with connect() as conn:
         papers = load_sample_papers(conn, run_id)
         if not papers:
             print(f"No sample papers found for run_id={run_id}", file=sys.stderr)
             return 1
-        estimate = estimate_bakeoff_run_cost(config, len(papers), n_passes=args.passes)
+        estimate = estimate_bakeoff_run_cost(estimate_config, len(papers), n_passes=args.passes)
         print("\nCost estimate (non-baseline candidates only):")
         print(json.dumps(estimate, indent=2))
 
@@ -101,10 +120,7 @@ def main() -> int:
             print("\nNo API calls made. Re-run with --allow-paid to execute.")
             return 0
 
-        missing_models = [
-            c for c in config.candidates
-            if c.id != config.baseline_candidate_id and not resolved.get(c.model, False)
-        ]
+        missing_models = [c for c in selected if not resolved.get(c.model, False)]
         if missing_models:
             print("Aborting: unresolved models on OpenRouter:", [c.model for c in missing_models], file=sys.stderr)
             return 1
@@ -113,7 +129,7 @@ def main() -> int:
         require_api_key()
         client = create_llm_client()
 
-        for candidate in config.candidates:
+        for candidate in selected:
             if candidate.id == config.baseline_candidate_id:
                 print(f"Skipping baseline {candidate.id} (already imported)")
                 continue

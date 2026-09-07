@@ -1,89 +1,101 @@
 #!/usr/bin/env python3
-"""Extract prompt-guidance candidates from human bake-off disagreement reasoning.
-
-Report only — a human decides what goes into the next prompt version.
-"""
+"""Extract prompt-guidance patterns from human labelling disagreements."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
+from uuid import UUID
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from research_radar.bakeoff import group_disagreements_by_pattern  # noqa: E402
+from research_radar.bakeoff import is_force_fit, is_general_method, load_human_labels  # noqa: E402
 from research_radar.pipeline import connect
 
 REPORTS_DIR = ROOT / "reports"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Extract bake-off prompt guidance from human labels")
-    parser.add_argument("--run-id", required=True)
-    args = parser.parse_args()
+def build_guidance(run_id: UUID, labels: list[dict], results: list[dict]) -> str:
+    by_paper: dict[int, list[dict]] = defaultdict(list)
+    for row in labels:
+        by_paper[int(row["content_id"])].append(row)
 
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT bl.content_id, bl.labeller, bl.domain, bl.application_domains,
-                   bl.is_general_method, bl.reasoning, ci.title
-            FROM research_radar.bakeoff_labels bl
-            JOIN research_radar.content_items ci ON ci.id = bl.content_id
-            WHERE bl.run_id = %s AND bl.reasoning IS NOT NULL AND TRIM(bl.reasoning) <> ''
-            """,
-            (args.run_id,),
-        ).fetchall()
-        disagreements = [dict(r) for r in rows]
+    model_p1 = {
+        int(r["content_id"]): r
+        for r in results
+        if int(r.get("pass_index") or 1) == 1
+    }
 
-    buckets = group_disagreements_by_pattern(disagreements)
+    patterns: dict[str, list[str]] = defaultdict(list)
+
+    for cid, lab_rows in by_paper.items():
+        if len(lab_rows) < 1:
+            continue
+        human_domains = [r.get("application_domain") for r in lab_rows]
+        human_general_votes = [is_general_method(d) for d in human_domains if d is not None]
+        if not human_general_votes:
+            continue
+        human_general = sum(human_general_votes) >= len(human_general_votes) / 2
+        model = model_p1.get(cid)
+        if model and is_force_fit(model.get("application_domain"), human_general):
+            reason = " | ".join(
+                str(r.get("reasoning") or "").strip() for r in lab_rows if r.get("reasoning")
+            )
+            patterns["force_fit_model_sector_human_general"].append(
+                f"content_id={cid}: model={model.get('application_domain')} human_general={human_general}. {reason}"
+            )
+        domain_sets = {tuple(sorted(d or [])) for d in human_domains if d}
+        if len(domain_sets) > 1:
+            patterns["human_disagreement_on_domain"].append(
+                f"content_id={cid}: labeller domains differ {domain_sets}"
+            )
+        for row in lab_rows:
+            if row.get("reasoning"):
+                patterns["human_reasoning_samples"].append(
+                    f"content_id={cid} [{row.get('labeller')}]: {row['reasoning']}"
+                )
+
     lines = [
-        "# Bake-off prompt guidance extraction",
+        f"# Bake-off prompt guidance — `{run_id}`",
         "",
-        f"**run_id:** `{args.run_id}`  ",
-        f"**Generated:** {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}  ",
-        f"**Labelled disagreements with reasoning:** {len(disagreements)}  ",
-        "",
-        "This report groups human reasoning by failure pattern. Do not apply automatically.",
+        "Candidate prompt clarifications derived from human labels. **Report only** — a human decides what enters the next prompt version.",
         "",
     ]
-
-    for bucket, items in buckets.items():
-        lines.append(f"## {bucket.replace('_', ' ').title()} ({len(items)})")
+    for pattern, examples in patterns.items():
+        lines.append(f"## {pattern}")
         lines.append("")
-        by_theme: dict[str, list[dict]] = defaultdict(list)
-        for item in items:
-            key = (item.get("reasoning") or "")[:80].strip()
-            by_theme[key].append(item)
-        for theme, group in sorted(by_theme.items(), key=lambda x: -len(x[1]))[:15]:
-            lines.append(f"### Pattern ({len(group)} papers)")
-            lines.append(f"> {theme}...")
-            sample = group[0]
-            lines.append(f"- Example: `{sample.get('title', '')[:70]}` (content_id={sample['content_id']})")
-            if sample.get("is_general_method") is not None:
-                lines.append(f"- Human general-method: {sample['is_general_method']}")
-            lines.append("")
-        lines.append("**Candidate prompt clarification:**")
-        if bucket == "force_fitting":
-            lines.append(
-                "- Reinforce that methods papers without a named sector must receive "
-                "`general-method` alone; constructing a plausible deployment chain is an error."
-            )
-        elif bucket == "domain_mismatch":
-            lines.append("- Clarify domain vs subdomain boundaries with one more in-prompt example.")
-        elif bucket == "audience_mismatch":
-            lines.append("- Distinguish practitioner vs technical_leadership with a counterexample.")
-        else:
-            lines.append("- Review individual reasoning snippets above for recurring phrasing.")
+        for ex in examples[:25]:
+            lines.append(f"- {ex}")
+        if len(examples) > 25:
+            lines.append(f"- … and {len(examples) - 25} more")
         lines.append("")
+    if not patterns:
+        lines.append("_No labelled disagreements imported yet._")
+    return "\n".join(lines)
 
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = REPORTS_DIR / f"bakeoff-guidance-{args.run_id}.md"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"Wrote {path}")
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Extract bake-off prompt guidance from labels")
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--out", default=None)
+    args = parser.parse_args()
+
+    run_id = UUID(args.run_id)
+    out = Path(args.out) if args.out else REPORTS_DIR / f"bakeoff-guidance-{run_id}.md"
+
+    with connect() as conn:
+        labels = load_human_labels(conn, run_id)
+        from research_radar.bakeoff import load_results_for_run
+
+        results = load_results_for_run(conn, run_id)
+
+    guidance = build_guidance(run_id, labels, results)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(guidance, encoding="utf-8")
+    print(f"Wrote {out}")
     return 0
 
 

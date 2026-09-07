@@ -133,7 +133,7 @@ Verifier recounts from DB or file — never stdout.
 - Classification/screening candidates run with **reasoning disabled**. Quality pass requires reasoning.
 - Bake-off winner is decided by **accuracy against human labels**, subject to structured-output and batch-stability gates — not cost or leaderboard rank.
 - Human labelling exports must **not** show model outputs on labelling sheets (see `bakeoff_export_labels.py`).
-- Migrations `015` (general-method application) and `016` (bakeoff tables) are unapplied until human runs `setup_db.sh`.
+- Migrations `015` (general-method application) and `019` (bakeoff tables) are unapplied until human runs `setup_db.sh`.
 - Agents do **not** run the bake-off or paid stages without explicit `--allow-paid`.
 
 ## Quality scorer constraints
@@ -152,5 +152,6 @@ Verifier recounts from DB or file — never stdout.
 
 ## Active work
 
-Classification model bake-off harness: `scripts/bakeoff_*.py`, `sql/016_bakeoff.sql`.
+Classification model bake-off harness: `scripts/bakeoff_*.py`, `sql/019_bakeoff.sql`.
+Uses production `classify.py` prompt/schema — not a custom bake-off prompt.
 Human applies migrations 015–016 before running sample/import.

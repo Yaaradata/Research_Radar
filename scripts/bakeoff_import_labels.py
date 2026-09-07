@@ -1,152 +1,93 @@
 #!/usr/bin/env python3
-"""Import completed bake-off labelling workbook into bakeoff_labels."""
+"""Import completed labelling workbook into bakeoff_labels."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
+from uuid import UUID
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from openpyxl import load_workbook
 
-from research_radar.bakeoff import GENERAL_METHOD_VALUE  # noqa: E402
+from research_radar.bakeoff import LABELLERS  # noqa: E402
 from research_radar.pipeline import connect
 
-LABELLERS = ("subhashini", "urmila", "ranjith")
-LABEL_COLS = ("domain", "subdomains", "application_domains", "is_general_method", "reasoning")
-SHEETS = ("Disagreements", "Agreement control")
 
-
-def _parse_bool(val) -> bool | None:
-    if val is None or (isinstance(val, str) and not val.strip()):
+def _parse_domains(raw: str | None) -> list[str] | None:
+    if raw is None or str(raw).strip() == "":
         return None
-    if isinstance(val, bool):
-        return val
-    s = str(val).strip().lower()
-    if s in ("true", "1", "yes"):
-        return True
-    if s in ("false", "0", "no"):
-        return False
-    return None
+    return [p.strip() for p in str(raw).split(",") if p.strip()]
 
 
-def _parse_apps(val) -> list[str] | None:
-    if val is None or (isinstance(val, str) and not val.strip()):
-        return None
-    if isinstance(val, str):
-        parts = [p.strip() for p in val.replace(";", ",").split(",") if p.strip()]
-        return parts or None
-    return [str(val)]
-
-
-def _header_map(header: list) -> dict[str, int]:
-    return {str(h): i for i, h in enumerate(header) if h}
-
-
-def _row_labels(row: list, hmap: dict[str, int], labeller: str) -> dict | None:
-    cid_idx = hmap.get("content_id")
-    if cid_idx is None or cid_idx >= len(row) or row[cid_idx] in (None, ""):
-        return None
-    try:
-        cid = int(row[cid_idx])
-    except (TypeError, ValueError):
-        return None
-
-    def cell(name):
-        key = f"{labeller}_{name}"
-        idx = hmap.get(key)
-        if idx is None or idx >= len(row):
-            return None
-        return row[idx]
-
-    domain = cell("domain")
-    if domain is not None:
-        domain = str(domain).strip() or None
-    subdomains_raw = cell("subdomains")
-    subdomains = None
-    if subdomains_raw not in (None, ""):
-        subdomains = [s.strip() for s in str(subdomains_raw).replace(";", ",").split(",") if s.strip()]
-    apps = _parse_apps(cell("application_domains"))
-    is_gm = _parse_bool(cell("is_general_method"))
-    if is_gm is None and apps:
-        is_gm = GENERAL_METHOD_VALUE in apps
-    reasoning = cell("reasoning")
-    if reasoning is not None:
-        reasoning = str(reasoning).strip() or None
-
-    if not any([domain, subdomains, apps, is_gm is not None, reasoning]):
-        return None
-
-    return {
-        "content_id": cid,
-        "labeller": labeller,
-        "domain": domain,
-        "subdomains": subdomains,
-        "application_domains": apps,
-        "is_general_method": is_gm,
-        "reasoning": reasoning,
-    }
+def _import_sheet(conn, run_id: UUID, ws, labellers: tuple[str, ...]) -> tuple[int, int]:
+    headers = [c.value for c in ws[1]]
+    inserted = 0
+    skipped = 0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or row[0] is None:
+            skipped += 1
+            continue
+        content_id = int(row[0])
+        for i, labeller in enumerate(labellers):
+            base = 3 + i * 4
+            app_dom = _parse_domains(row[base] if base < len(row) else None)
+            audience = _parse_domains(row[base + 1] if base + 1 < len(row) else None)
+            paper_kind = row[base + 2] if base + 2 < len(row) else None
+            reasoning = row[base + 3] if base + 3 < len(row) else None
+            if not any([app_dom, audience, paper_kind, reasoning]):
+                continue
+            conn.execute(
+                """
+                INSERT INTO research_radar.bakeoff_labels (
+                    content_id, run_id, labeller,
+                    application_domain, audience_relevance, paper_kind, reasoning
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (content_id, run_id, labeller) DO UPDATE SET
+                    application_domain = EXCLUDED.application_domain,
+                    audience_relevance = EXCLUDED.audience_relevance,
+                    paper_kind = EXCLUDED.paper_kind,
+                    reasoning = EXCLUDED.reasoning,
+                    labelled_at = NOW()
+                """,
+                (
+                    content_id,
+                    str(run_id),
+                    labeller,
+                    app_dom,
+                    audience,
+                    str(paper_kind).strip() if paper_kind else None,
+                    str(reasoning).strip() if reasoning else None,
+                ),
+            )
+            inserted += 1
+    return inserted, skipped
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Import bake-off labels from xlsx")
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--workbook", type=Path, required=True)
+    parser.add_argument("--workbook", required=True, help="Path to completed .xlsx")
     args = parser.parse_args()
 
+    run_id = UUID(args.run_id)
     wb = load_workbook(args.workbook, read_only=True, data_only=True)
-    imported = 0
-    skipped = 0
 
+    total_inserted = 0
+    total_skipped = 0
     with connect() as conn:
-        for sheet_name in SHEETS:
+        for sheet_name in ("Disagreements", "Agreement control"):
             if sheet_name not in wb.sheetnames:
                 continue
-            ws = wb[sheet_name]
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows:
-                continue
-            hmap = _header_map(list(rows[0]))
-            for row in rows[1:]:
-                if not row or row[0] in (None, ""):
-                    skipped += 1
-                    continue
-                for lab in LABELLERS:
-                    label = _row_labels(list(row), hmap, lab)
-                    if label is None:
-                        continue
-                    conn.execute(
-                        """
-                        INSERT INTO research_radar.bakeoff_labels (
-                            content_id, run_id, labeller, domain, subdomains,
-                            application_domains, is_general_method, reasoning
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (content_id, run_id, labeller) DO UPDATE SET
-                            domain = EXCLUDED.domain,
-                            subdomains = EXCLUDED.subdomains,
-                            application_domains = EXCLUDED.application_domains,
-                            is_general_method = EXCLUDED.is_general_method,
-                            reasoning = EXCLUDED.reasoning,
-                            labelled_at = NOW()
-                        """,
-                        (
-                            label["content_id"],
-                            args.run_id,
-                            label["labeller"],
-                            label["domain"],
-                            label["subdomains"],
-                            label["application_domains"],
-                            label["is_general_method"],
-                            label["reasoning"],
-                        ),
-                    )
-                    imported += 1
+            ins, sk = _import_sheet(conn, run_id, wb[sheet_name], LABELLERS)
+            total_inserted += ins
+            total_skipped += sk
         conn.commit()
 
-    print(f"Imported {imported} label rows, skipped {skipped} blank rows")
+    print(f"Imported {total_inserted} label rows ({total_skipped} blank rows skipped)")
     return 0
 
 

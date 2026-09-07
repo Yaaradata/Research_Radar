@@ -1,124 +1,59 @@
-"""Classification / screening model bake-off — shared prompt, schema, metrics.
+"""Classification model bake-off — shared classify prompt, measured on our papers.
 
-High-volume fixed-schema calls: domain, subdomains, application_domains,
-primary_audience, ai_relevance. Reasoning disabled for all candidates.
-Quality pass is out of scope.
+Uses the production classify prompt/schema from classify.py. Bake-off output
+lives in bakeoff_* tables only — never content_classifications.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import random
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import requests
 import yaml
 
-from research_radar.classification_vocab import AUDIENCE_RELEVANCE
-from research_radar.llm_batch import LLMBatchError, call_chat_completion, random_batches, strip_json_fences
-from research_radar.semantic_scoring import build_quality_batch_user_prompt, create_llm_client, require_api_key
-from research_radar.topics import (
-    TOPICS_SYSTEM_PROMPT,
-    build_vocabulary_block,
-    load_topic_vocabulary,
+from research_radar.classification_vocab import (
+    APPLICATION_DOMAINS,
+    AUDIENCE_RELEVANCE,
+    GEOGRAPHY_FOCUS,
+    PAPER_KINDS,
 )
+from research_radar.classify import (
+    CLASSIFY_BATCH_SIZE,
+    CLASSIFY_INPUT_KIND,
+    CLASSIFY_PROMPT_VERSION,
+    CLASSIFY_RESPONSE_SCHEMA,
+    CLASSIFY_SYSTEM_PROMPT,
+    ClassifyParseError,
+    parse_classify_batch,
+)
+from research_radar.llm_batch import LLMBatchError, call_chat_completion, random_batches, strip_json_fences
+from research_radar.semantic_scoring import build_quality_batch_user_prompt, create_llm_client
 
 log = logging.getLogger("research-radar")
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = ROOT / "config" / "bakeoff_models.yaml"
 
-BAKEOFF_PROMPT_KIND = "classification-screening"
-BAKEOFF_PROMPT_VERSION = (
-    os.getenv("BAKEOFF_PROMPT_VERSION", "classification-bakeoff-v1").strip() or "classification-bakeoff-v1"
+BASELINE_CANDIDATE_ID = "haiku"
+LABELLERS = ("subhashini", "urmila", "ranjith")
+
+NON_STANDARD_PAPER_KINDS = frozenset(
+    {"survey_review", "benchmark_dataset", "theory", "negative_result"}
 )
-
-GENERAL_METHOD_VALUE = "general-method"
-
-APPLICATION_DOMAIN_INSTRUCTION = """
-general-method    The paper presents a method, model or theoretical result
-                  with no specific application domain. Most methods papers
-                  are this. Choosing general-method is a correct, expected
-                  answer - do NOT reach for a sector when none is addressed.
-                  If you find yourself constructing an argument for why a
-                  method "could apply" to a domain, the answer is
-                  general-method.
-
-general-method is mutually exclusive with every other application domain.
-Return general-method alone when it applies; never combine it with a sector.
-"""
-
-AUDIENCE_INSTRUCTION = """
-PRIMARY AUDIENCE — return exactly ONE value for primary_audience:
-
-practitioner           An engineer or data scientist could act on this.
-technical_leadership   Bears on architecture, platform or build-or-buy decisions.
-enterprise_adoption    Bears on deploying AI in an organisation.
-student                Good entry point for someone still learning the subfield.
-"""
-
-AI_RELEVANCE_INSTRUCTION = """
-AI RELEVANCE (ai_relevance) — score 0-10 in 0.5 increments:
-
-Is this AI, ML, or their direct application? This is a gate dimension only.
-Use the same absolute scale as the screen pass: 0 = not AI-related, 10 = core AI.
-"""
-
-BAKEOFF_SYSTEM_PROMPT = (
-    TOPICS_SYSTEM_PROMPT.replace(
-        "applications ZERO to FOUR, chosen from the APPLICATIONS list below. Only\n"
-        "            include an application the paper explicitly addresses or\n"
-        "            evaluates. An abstract that never mentions education must not be\n"
-        "            tagged education.",
-        "application_domains ZERO to FOUR, chosen from the APPLICATIONS list below.\n"
-        "            When no sector is explicitly addressed, return [\"general-method\"]\n"
-        "            — never an empty list. Only include a sector application the paper\n"
-        "            explicitly addresses or evaluates.",
-    )
-    + "\n"
-    + APPLICATION_DOMAIN_INSTRUCTION
-    + "\n"
-    + AUDIENCE_INSTRUCTION
-    + "\n"
-    + AI_RELEVANCE_INSTRUCTION
-    + "\n\n"
-    "Return ONLY a JSON object with a single key \"papers\", whose value is an array\n"
-    "with one object per paper, in the order supplied. No prose, no markdown fences.\n\n"
-    '{"papers": [{"paper_id": <int>, "domain": "...", "subdomains": ["..."], '
-    '"application_domains": ["..."], "primary_audience": "...", '
-    '"ai_relevance": <0-10>}]}\n'
-)
-
-# Fallback when DB vocabulary is unavailable (unit tests).
-FALLBACK_DOMAINS = [
-    "Natural Language Processing",
-    "Computer Vision",
-    "Reinforcement Learning",
-    "Machine Learning Theory",
-    "Other",
-]
-FALLBACK_SUBDOMAINS = {
-    "Natural Language Processing": ["Text Classification", "Question Answering"],
-    "Computer Vision": ["Object Detection", "Image Classification"],
-    "Reinforcement Learning": ["Deep Reinforcement Learning"],
-    "Machine Learning Theory": ["Optimization Theory"],
-    "Other": [],
+STRATUM_TARGETS = {
+    "general_method": 150,
+    "specific_sector": 150,
+    "non_standard_kind": 50,
+    "remainder": 50,
 }
-FALLBACK_APPLICATIONS = [
-    "general-method",
-    "education",
-    "healthcare",
-    "finance",
-    "security",
-    "defense",
-]
 
 
 @dataclass
@@ -133,9 +68,39 @@ class BakeoffCandidate:
 @dataclass
 class BakeoffConfig:
     candidates: list[BakeoffCandidate]
-    batch_size: int = 10
+    batch_size: int = CLASSIFY_BATCH_SIZE
     sample_size: int = 400
-    sample_seed: int = 20260905
+    sample_seed: int = 20260907
+    baseline_prompt_version: str = CLASSIFY_PROMPT_VERSION
+    baseline_date_from: str = "2026-09-01"
+    baseline_date_until: str = "2026-09-04"
+    baseline_candidate_id: str = BASELINE_CANDIDATE_ID
+
+
+@dataclass
+class PaperValidation:
+    raw_response: str
+    json_valid: bool
+    schema_valid: bool
+    dropped_values: list[str]
+    application_domain: list[str] | None = None
+    audience_relevance: list[str] | None = None
+    paper_kind: str | None = None
+    geography_focus: str | None = None
+    domain_confidence: float | None = None
+    exclusivity_violation: bool = False
+
+
+@dataclass
+class BakeoffCallResult:
+    content_id: int
+    validation: PaperValidation
+    retries: int
+    json_valid_first_try: bool
+    tokens_in: int
+    tokens_out: int
+    cost_usd: float
+    latency_ms: int
 
 
 def load_bakeoff_config(path: Path | None = None) -> BakeoffConfig:
@@ -153,621 +118,725 @@ def load_bakeoff_config(path: Path | None = None) -> BakeoffConfig:
     ]
     return BakeoffConfig(
         candidates=candidates,
-        batch_size=int(raw.get("batch_size", 10)),
+        batch_size=int(raw.get("batch_size", CLASSIFY_BATCH_SIZE)),
         sample_size=int(raw.get("sample_size", 400)),
-        sample_seed=int(raw.get("sample_seed", 20260905)),
+        sample_seed=int(raw.get("sample_seed", 20260907)),
+        baseline_prompt_version=str(raw.get("baseline_prompt_version", CLASSIFY_PROMPT_VERSION)),
+        baseline_date_from=str(raw.get("baseline_date_from", "2026-09-01")),
+        baseline_date_until=str(raw.get("baseline_date_until", "2026-09-04")),
+        baseline_candidate_id=str(raw.get("baseline_candidate_id", BASELINE_CANDIDATE_ID)),
     )
 
 
-def fallback_vocabulary() -> dict:
-    return {
-        "domains_list": list(FALLBACK_DOMAINS),
-        "subdomains_by_domain": {k: list(v) for k, v in FALLBACK_SUBDOMAINS.items()},
-        "applications_list": list(FALLBACK_APPLICATIONS),
-    }
+def new_run_id() -> UUID:
+    return uuid4()
 
 
-def vocabulary_from_conn(conn) -> dict:
-    try:
-        return load_topic_vocabulary(conn)
-    except Exception:
-        return fallback_vocabulary()
+def reasoning_effort_for(candidate: BakeoffCandidate) -> str | None:
+    if candidate.reasoning == "disabled":
+        return None
+    if candidate.reasoning == "minimum":
+        return "low"
+    return None
 
 
-def build_bakeoff_user_prompt(papers: list[dict], vocab: dict) -> str:
-    block = build_vocabulary_block(vocab)
-    return block + "\n\n" + build_quality_batch_user_prompt(papers)
-
-
-def bakeoff_response_schema(vocab: dict) -> dict:
-    domains = vocab.get("domains_list") or FALLBACK_DOMAINS
-    all_subdomains: list[str] = []
-    for subs in (vocab.get("subdomains_by_domain") or {}).values():
-        all_subdomains.extend(subs)
-    applications = vocab.get("applications_list") or FALLBACK_APPLICATIONS
-    if GENERAL_METHOD_VALUE not in applications:
-        applications = [GENERAL_METHOD_VALUE, *applications]
-
-    item_schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "paper_id": {"type": "integer"},
-            "domain": {"type": "string", "enum": domains + ["Other"]},
-            "subdomains": {
-                "type": "array",
-                "items": {"type": "string", "enum": all_subdomains or ["Other"]},
-                "maxItems": 3,
-            },
-            "application_domains": {
-                "type": "array",
-                "items": {"type": "string", "enum": applications},
-                "maxItems": 4,
-            },
-            "primary_audience": {"type": "string", "enum": list(AUDIENCE_RELEVANCE)},
-            "ai_relevance": {"type": "number"},
-        },
-        "required": [
-            "paper_id",
-            "domain",
-            "subdomains",
-            "application_domains",
-            "primary_audience",
-            "ai_relevance",
-        ],
-    }
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {"papers": {"type": "array", "items": item_schema}},
-        "required": ["papers"],
-    }
-
-
-class BakeoffParseError(ValueError):
-    pass
-
-
-def count_general_method_violations(application_domains: list[str]) -> int:
-    """general-method must not co-occur with any other application domain."""
-    if not application_domains:
-        return 0
-    has_gm = GENERAL_METHOD_VALUE in application_domains
-    if has_gm and len(application_domains) > 1:
-        return 1
-    return 0
-
-
-def is_general_method(application_domains: list[str] | None) -> bool:
-    if not application_domains:
-        return False
-    return GENERAL_METHOD_VALUE in application_domains
-
-
-def normalize_application_domains(raw: list[str] | None) -> list[str]:
-    return [str(x).strip() for x in (raw or []) if str(x).strip()]
-
-
-def parse_bakeoff_batch(text: str, expected_ids: set[int]) -> dict[int, dict]:
-    raw = strip_json_fences(text)
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise BakeoffParseError(f"invalid JSON: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise BakeoffParseError("response must be a JSON object with a 'papers' array")
-    items = payload.get("papers")
-    if not isinstance(items, list):
-        raise BakeoffParseError("response object missing 'papers' array")
-
-    out: dict[int, dict] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            raise BakeoffParseError("each item must be an object")
-        try:
-            pid = int(item.get("paper_id"))
-        except (TypeError, ValueError) as exc:
-            raise BakeoffParseError(f"invalid paper_id: {item.get('paper_id')!r}") from exc
-        if pid not in expected_ids:
-            continue
-
-        app_domains = normalize_application_domains(item.get("application_domains"))
-        if count_general_method_violations(app_domains):
-            raise BakeoffParseError(f"paper {pid} general-method combined with other domains")
-        if not app_domains:
-            raise BakeoffParseError(f"paper {pid} application_domains must not be empty")
-
-        audience = (item.get("primary_audience") or "").strip()
-        if audience not in AUDIENCE_RELEVANCE:
-            raise BakeoffParseError(f"paper {pid} invalid primary_audience: {audience!r}")
-
-        try:
-            ai_rel = float(item["ai_relevance"])
-        except (TypeError, ValueError, KeyError) as exc:
-            raise BakeoffParseError(f"paper {pid} missing ai_relevance") from exc
-        ai_rel = round(ai_rel * 2) / 2.0
-        if ai_rel < 0.0 or ai_rel > 10.0:
-            raise BakeoffParseError(f"paper {pid} ai_relevance out of range")
-
-        domain = str(item.get("domain") or "").strip()
-        subdomains = [str(s).strip() for s in (item.get("subdomains") or []) if str(s).strip()]
-
-        out[pid] = {
-            "domain": domain,
-            "subdomains": subdomains,
-            "application_domains": app_domains,
-            "primary_audience": audience,
-            "ai_relevance": ai_rel,
-        }
-    return out
-
-
-def estimate_tokens_for_papers(papers: list[dict], vocab: dict) -> tuple[int, int]:
-    """Rough token estimate: chars/4 for prompt, fixed output per paper."""
-    prompt = BAKEOFF_SYSTEM_PROMPT + build_bakeoff_user_prompt(papers, vocab)
-    est_in = max(1, len(prompt) // 4)
-    est_out = 60 * len(papers)
-    return est_in, est_out
-
-
-def cost_from_tokens(tokens_in: int, tokens_out: int, candidate: BakeoffCandidate) -> float:
+def cost_from_tokens(
+    tokens_in: int,
+    tokens_out: int,
+    *,
+    input_cost_per_million: float,
+    output_cost_per_million: float,
+) -> float:
     return round(
-        (tokens_in / 1_000_000.0) * candidate.input_cost_per_million
-        + (tokens_out / 1_000_000.0) * candidate.output_cost_per_million,
+        (tokens_in / 1_000_000.0) * input_cost_per_million
+        + (tokens_out / 1_000_000.0) * output_cost_per_million,
         6,
     )
 
 
 def cost_per_thousand_from_measured(
-    total_cost: float, paper_count: int
+    rows: list[dict],
+    *,
+    input_cost_per_million: float,
+    output_cost_per_million: float,
 ) -> float:
-    if paper_count <= 0:
+    n = len(rows)
+    if n == 0:
         return 0.0
-    return round((total_cost / paper_count) * 1000.0, 4)
+    tin = sum(int(r.get("tokens_in") or 0) for r in rows)
+    tout = sum(int(r.get("tokens_out") or 0) for r in rows)
+    total = cost_from_tokens(
+        tin,
+        tout,
+        input_cost_per_million=input_cost_per_million,
+        output_cost_per_million=output_cost_per_million,
+    )
+    return round(total / n * 1000.0, 4)
 
 
-def estimate_full_bakeoff_cost(config: BakeoffConfig, vocab: dict, paper_count: int | None = None) -> dict:
-    """Estimate cost for sample_size × candidates × 3 passes (pass1, pass2, batch-B)."""
-    n = paper_count if paper_count is not None else config.sample_size
-    batches = max(1, math.ceil(n / config.batch_size))
-    dummy_papers = [
-        {
-            "content_id": i + 1,
-            "title": "Sample paper title for token estimation",
-            "abstract": "A" * 1200,
-            "categories": ["cs.AI", "cs.LG"],
-        }
-        for i in range(config.batch_size)
-    ]
-    est_in, est_out = estimate_tokens_for_papers(dummy_papers, vocab)
-    calls_per_pass = batches
-    passes = 3
-    per_candidate = {
-        "calls": calls_per_pass * passes,
-        "papers": n * passes,
-        "tokens_in": est_in * calls_per_pass * passes,
-        "tokens_out": est_out * calls_per_pass * passes,
-    }
-    lines = []
-    total_cost = 0.0
-    for cand in config.candidates:
-        cost = cost_from_tokens(per_candidate["tokens_in"], per_candidate["tokens_out"], cand)
-        total_cost += cost
-        lines.append(
-            {
-                "candidate_id": cand.id,
-                "model": cand.model,
-                "estimated_cost_usd": cost,
-                "calls": per_candidate["calls"],
-                "papers_scored": per_candidate["papers"],
-            }
+def verify_openrouter_models(model_ids: list[str], *, api_key: str | None = None) -> dict[str, bool]:
+    """Return {model_id: resolves} for each requested id. Does not substitute."""
+    api_key = api_key or os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return {m: False for m in model_ids}
+    try:
+        resp = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=30,
         )
-    return {
-        "sample_size": n,
-        "candidates": len(config.candidates),
-        "passes_per_candidate": passes,
-        "total_estimated_cost_usd": round(total_cost, 2),
-        "per_candidate": lines,
-    }
+        resp.raise_for_status()
+        available = {item["id"] for item in resp.json().get("data", [])}
+    except Exception as exc:
+        log.warning("OpenRouter model list failed: %s", exc)
+        return {m: False for m in model_ids}
+    return {m: m in available for m in model_ids}
 
 
-# ---------------------------------------------------------------------------
-# Sample selection
-# ---------------------------------------------------------------------------
-
-STRATA = (
-    ("ai_core", 100, ("cs.AI", "cs.CL", "cs.LG", "cs.NE")),
-    ("cs_cv", 100, ("cs.CV",)),
-    ("non_ai_cs", 100, ("cs.CR", "cs.NI", "cs.DB", "cs.SE", "cs.DS")),
-    ("other", 100, ()),
-)
-
-
-def _categories_match(categories: list[str], prefixes: tuple[str, ...]) -> bool:
-    if not prefixes:
-        return True
-    for cat in categories:
-        c = (cat or "").strip()
-        for p in prefixes:
-            if c == p or c.startswith(p + "."):
-                return True
-    return False
-
-
-def _parse_categories(raw: Any) -> list[str]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return [str(x) for x in parsed]
-        except json.JSONDecodeError:
-            return [raw]
-        return []
-    if isinstance(raw, list):
-        return [str(x) for x in raw]
-    return []
-
-
-def load_eligible_papers(conn) -> list[dict]:
+def load_baseline_classified_papers(conn, config: BakeoffConfig | None = None) -> list[dict]:
+    config = config or load_bakeoff_config()
     rows = conn.execute(
         """
-        SELECT ci.id AS content_id,
-               ci.title,
-               COALESCE(pm.abstract, ci.summary, '') AS abstract,
-               COALESCE(pm.categories, ci.categories_raw, '[]'::jsonb) AS categories
-        FROM research_radar.content_items ci
+        SELECT
+            cc.content_id,
+            ci.title,
+            COALESCE(pm.categories, ci.categories_raw, '[]'::jsonb) AS categories,
+            COALESCE(pm.abstract, ci.summary, '') AS abstract,
+            cc.application_domain,
+            cc.audience_relevance,
+            cc.paper_kind,
+            cc.geography_focus,
+            cc.domain_confidence,
+            cc.model AS baseline_model
+        FROM research_radar.content_classifications cc
+        JOIN research_radar.content_items ci ON ci.id = cc.content_id
         LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
-        WHERE ci.status IN ('RELEVANT', 'ENRICHED', 'ENTITY_RESOLVED', 'SCORED', 'CANDIDATE')
-          AND COALESCE(pm.abstract, ci.summary, '') <> ''
-        """
+        WHERE cc.prompt_version = %s
+          AND cc.classify_input_kind = %s
+          AND ci.published_at >= %s::date
+          AND ci.published_at < (%s::date + INTERVAL '1 day')
+        ORDER BY cc.content_id
+        """,
+        (
+            config.baseline_prompt_version,
+            CLASSIFY_INPUT_KIND,
+            config.baseline_date_from,
+            config.baseline_date_until,
+        ),
     ).fetchall()
-    out = []
-    for r in rows:
-        cats = _parse_categories(r["categories"])
-        out.append(
-            {
-                "content_id": int(r["content_id"]),
-                "title": r["title"] or "",
-                "abstract": r["abstract"] or "",
-                "categories": cats,
-            }
-        )
-    return out
+    return [dict(r) for r in rows]
+
+
+def _stratum_key(paper: dict) -> str | None:
+    domains = paper.get("application_domain") or []
+    if "general_method" in domains:
+        return "general_method"
+    if any(d for d in domains if d != "general_method"):
+        return "specific_sector"
+    if paper.get("paper_kind") in NON_STANDARD_PAPER_KINDS:
+        return "non_standard_kind"
+    return None
 
 
 def select_stratified_sample(
     papers: list[dict],
     *,
     seed: int,
-    strata: tuple[tuple[str, int, tuple[str, ...]], ...] = STRATA,
+    targets: dict[str, int] | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
+    """Draw stratified sample without replacement. Returns (sample, counts_by_stratum)."""
+    targets = targets or STRATUM_TARGETS
     rng = random.Random(seed)
-    shuffled = list(papers)
-    rng.shuffle(shuffled)
-
-    used: set[int] = set()
-    selected: list[dict] = []
+    by_id = {int(p["content_id"]): p for p in papers}
+    selected_ids: set[int] = set()
     counts: dict[str, int] = {}
 
-    for name, target, prefixes in strata:
-        pool = []
-        for p in shuffled:
-            if p["content_id"] in used:
-                continue
-            cats = p.get("categories") or []
-            if name == "other":
-                if _categories_match(cats, ("cs.AI", "cs.CL", "cs.LG", "cs.NE", "cs.CV")):
-                    continue
-                if _categories_match(cats, ("cs.CR", "cs.NI", "cs.DB", "cs.SE", "cs.DS")):
-                    continue
-                pool.append(p)
-            elif name == "ai_core" or name == "cs_cv" or name == "non_ai_cs":
-                if _categories_match(cats, prefixes):
-                    pool.append(p)
-            else:
-                pool.append(p)
-        take = pool[:target]
-        for p in take:
-            used.add(p["content_id"])
-            selected.append(p)
-        counts[name] = len(take)
+    pools: dict[str, list[dict]] = {
+        "general_method": [],
+        "specific_sector": [],
+        "non_standard_kind": [],
+        "remainder": [],
+    }
+    for p in papers:
+        cid = int(p["content_id"])
+        domains = p.get("application_domain") or []
+        if "general_method" in domains:
+            pools["general_method"].append(p)
+        elif any(d for d in domains if d != "general_method"):
+            pools["specific_sector"].append(p)
+        if p.get("paper_kind") in NON_STANDARD_PAPER_KINDS:
+            pools["non_standard_kind"].append(p)
 
-    return selected, counts
+    for stratum in ("general_method", "specific_sector", "non_standard_kind"):
+        n = targets[stratum]
+        pool = [p for p in pools[stratum] if int(p["content_id"]) not in selected_ids]
+        rng.shuffle(pool)
+        picked = pool[: min(n, len(pool))]
+        for p in picked:
+            selected_ids.add(int(p["content_id"]))
+        counts[stratum] = len(picked)
 
+    remainder_target = targets["remainder"]
+    remainder_pool = [p for p in papers if int(p["content_id"]) not in selected_ids]
+    rng.shuffle(remainder_pool)
+    picked = remainder_pool[: min(remainder_target, len(remainder_pool))]
+    for p in picked:
+        selected_ids.add(int(p["content_id"]))
+    counts["remainder"] = len(picked)
 
-def persist_sample(conn, run_id: UUID, seed: int, sample: list[dict], prompt_version: str):
-    conn.execute(
-        """
-        INSERT INTO research_radar.bakeoff_runs (run_id, sample_seed, sample_size, prompt_kind, prompt_version)
-        VALUES (%s, %s, %s, %s, %s)
-        """,
-        (str(run_id), seed, len(sample), BAKEOFF_PROMPT_KIND, prompt_version),
-    )
-    conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# Gates
-# ---------------------------------------------------------------------------
-
-PROBE_PAPER = {
-    "content_id": 0,
-    "title": "A General Attention Mechanism for Sequence Modelling",
-    "abstract": (
-        "We propose a new attention variant and evaluate on standard language modelling "
-        "benchmarks. Results show modest improvements over baselines."
-    ),
-    "categories": ["cs.CL", "cs.LG"],
-}
+    sample = [by_id[cid] for cid in sorted(selected_ids)]
+    return sample, counts
 
 
-def reasoning_effort_for(candidate: BakeoffCandidate) -> str | None:
-    if candidate.reasoning in ("disabled", "none", "off"):
-        return None
-    return "low"
+def reconstruct_raw_response(paper: dict) -> str:
+    """Rebuild classify JSON from stored classification fields (Haiku baseline import)."""
+    payload = {
+        "papers": [
+            {
+                "paper_id": int(paper["content_id"]),
+                "application_domain": list(paper.get("application_domain") or []),
+                "audience_relevance": list(paper.get("audience_relevance") or []),
+                "paper_kind": paper.get("paper_kind"),
+                "geography_focus": paper.get("geography_focus"),
+                "domain_confidence": float(paper["domain_confidence"])
+                if paper.get("domain_confidence") is not None
+                else None,
+            }
+        ]
+    }
+    return json.dumps(payload, separators=(",", ":"))
 
 
-def test_structured_output_gate(candidate: BakeoffCandidate, vocab: dict, *, client=None) -> dict:
-    """Returns {passed: bool, json_valid_first_try: bool, error: str|None}."""
-    require_api_key()
-    if client is None:
-        client = create_llm_client()
-    schema = bakeoff_response_schema(vocab)
-    user_prompt = build_bakeoff_user_prompt([PROBE_PAPER], vocab)
+def analyze_raw_classify_response(raw_text: str, expected_ids: set[int]) -> dict[int, PaperValidation]:
+    """Validate raw model text without raising — invalid output remains measurable."""
+    out: dict[int, PaperValidation] = {}
+    json_valid = False
+    items: list[Any] = []
+    dropped_global: list[str] = []
+
     try:
-        result = call_chat_completion(
-            client,
-            model=candidate.model,
-            system_prompt=BAKEOFF_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            reasoning_effort=reasoning_effort_for(candidate),
-            temperature=0.0,
-            max_retries=1,
-            request_sleep=0.0,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "bakeoff_probe", "strict": True, "schema": schema},
-            },
-        )
-        parse_bakeoff_batch(result["text"], {0})
-        return {"passed": True, "json_valid_first_try": True, "error": None}
-    except (LLMBatchError, BakeoffParseError, json.JSONDecodeError) as exc:
-        return {"passed": False, "json_valid_first_try": False, "error": str(exc)}
+        payload = json.loads(strip_json_fences(raw_text))
+        json_valid = isinstance(payload, dict)
+        if json_valid:
+            items = payload.get("papers") if isinstance(payload.get("papers"), list) else []
+    except json.JSONDecodeError:
+        json_valid = False
 
-
-def agreement_rate(rows_a: dict[int, dict], rows_b: dict[int, dict], *, fields: tuple[str, ...]) -> float:
-    common = set(rows_a) & set(rows_b)
-    if not common:
-        return 0.0
-    agree = 0
-    for cid in common:
-        a, b = rows_a[cid], rows_b[cid]
-        if all(a.get(f) == b.get(f) for f in fields):
-            agree += 1
-    return agree / len(common)
-
-
-def batch_stability_passes(rows_a: dict[int, dict], rows_b: dict[int, dict], threshold: float = 0.95) -> bool:
-    fields = ("domain", "application_domains", "primary_audience", "ai_relevance")
-    return agreement_rate(rows_a, rows_b, fields=fields) >= threshold
-
-
-def self_consistency_passes(rows_1: dict[int, dict], rows_2: dict[int, dict], threshold: float = 0.95) -> bool:
-    return batch_stability_passes(rows_1, rows_2, threshold=threshold)
-
-
-# ---------------------------------------------------------------------------
-# Scoring run (single candidate, one pass)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class BakeoffCallResult:
-    content_id: int
-    parsed: dict | None
-    json_valid_first_try: bool
-    retries: int
-    tokens_in: int
-    tokens_out: int
-    cost_usd: float
-    latency_ms: int
-    raw_response: str | None
-
-
-def score_papers_batch(
-    papers: list[dict],
-    candidate: BakeoffCandidate,
-    vocab: dict,
-    *,
-    client=None,
-    batch_arrangement: str | None = None,
-) -> list[BakeoffCallResult]:
-    if client is None:
-        client = create_llm_client()
-    schema = bakeoff_response_schema(vocab)
-    user_prompt = build_bakeoff_user_prompt(papers, vocab)
-    expected_ids = {int(p["content_id"]) for p in papers}
-    retries = 0
-    json_valid_first_try = False
-    t0 = time.monotonic()
-    last_text = ""
-    parsed: dict[int, dict] = {}
-
-    for attempt in range(1, 4):
-        try:
-            result = call_chat_completion(
-                client,
-                model=candidate.model,
-                system_prompt=BAKEOFF_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                reasoning_effort=reasoning_effort_for(candidate),
-                temperature=0.0,
-                max_retries=1,
-                request_sleep=0.1,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": "bakeoff_batch", "strict": True, "schema": schema},
-                },
+    if not json_valid:
+        for pid in expected_ids:
+            out[pid] = PaperValidation(
+                raw_response=raw_text,
+                json_valid=False,
+                schema_valid=False,
+                dropped_values=["json_parse_failed"],
             )
-            last_text = result["text"]
-            parsed = parse_bakeoff_batch(last_text, expected_ids)
-            json_valid_first_try = attempt == 1
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            tokens_in = int(result["input_tokens"] or 0)
-            tokens_out = int(result["output_tokens"] or 0)
-            cost = cost_from_tokens(tokens_in, tokens_out, candidate)
-            out = []
-            for p in papers:
-                pid = int(p["content_id"])
-                row = parsed.get(pid)
-                out.append(
-                    BakeoffCallResult(
-                        content_id=pid,
-                        parsed=row,
-                        json_valid_first_try=json_valid_first_try and row is not None,
-                        retries=attempt - 1,
-                        tokens_in=tokens_in // max(1, len(papers)),
-                        tokens_out=tokens_out // max(1, len(papers)),
-                        cost_usd=cost / max(1, len(papers)),
-                        latency_ms=latency_ms // max(1, len(papers)),
-                        raw_response=last_text if row is None else None,
-                    )
-                )
-            return out
-        except (LLMBatchError, BakeoffParseError) as exc:
-            retries = attempt
-            if attempt >= 3:
-                latency_ms = int((time.monotonic() - t0) * 1000)
-                return [
-                    BakeoffCallResult(
-                        content_id=int(p["content_id"]),
-                        parsed=None,
-                        json_valid_first_try=False,
-                        retries=retries,
-                        tokens_in=0,
-                        tokens_out=0,
-                        cost_usd=0.0,
-                        latency_ms=latency_ms // max(1, len(papers)),
-                        raw_response=str(exc),
-                    )
-                    for p in papers
-                ]
-            time.sleep(min(30.0, 2 ** (attempt - 1)))
-    return []
+        return out
 
+    parsed_ids: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            dropped_global.append("non_object_item")
+            continue
+        try:
+            pid = int(item.get("paper_id"))
+        except (TypeError, ValueError):
+            dropped_global.append(f"invalid_paper_id:{item.get('paper_id')!r}")
+            continue
+        if pid not in expected_ids:
+            continue
+        parsed_ids.add(pid)
+        dropped: list[str] = list(dropped_global)
+        exclusivity = False
+        schema_valid = True
 
-def shuffle_batch_arrangement(papers: list[dict], seed: int) -> list[dict]:
-    rng = random.Random(seed)
-    out = list(papers)
-    rng.shuffle(out)
+        app_dom = item.get("application_domain")
+        audience = item.get("audience_relevance")
+        paper_kind = (item.get("paper_kind") or "").strip() if item.get("paper_kind") else ""
+        geography = (item.get("geography_focus") or "").strip() if item.get("geography_focus") else ""
+
+        if not isinstance(app_dom, list):
+            schema_valid = False
+            dropped.append("application_domain:not_list")
+            app_dom = None
+        elif len(app_dom) > 3:
+            schema_valid = False
+            dropped.append("application_domain:too_many")
+        else:
+            for v in app_dom:
+                if v not in APPLICATION_DOMAINS:
+                    schema_valid = False
+                    dropped.append(f"application_domain:invalid:{v}")
+            if "general_method" in app_dom and len(app_dom) > 1:
+                exclusivity = True
+                schema_valid = False
+                dropped.append("application_domain:general_method_exclusivity")
+
+        if not isinstance(audience, list) or not (1 <= len(audience) <= 4):
+            schema_valid = False
+            dropped.append("audience_relevance:invalid")
+            audience = None
+        elif audience is not None:
+            for v in audience:
+                if v not in AUDIENCE_RELEVANCE:
+                    schema_valid = False
+                    dropped.append(f"audience_relevance:invalid:{v}")
+
+        if paper_kind not in PAPER_KINDS:
+            schema_valid = False
+            dropped.append(f"paper_kind:invalid:{paper_kind!r}")
+            paper_kind = None
+        if geography not in GEOGRAPHY_FOCUS:
+            schema_valid = False
+            dropped.append(f"geography_focus:invalid:{geography!r}")
+            geography = None
+
+        conf = None
+        try:
+            conf_raw = float(item["domain_confidence"])
+            if conf_raw < 0.0 or conf_raw > 10.0:
+                schema_valid = False
+                dropped.append("domain_confidence:out_of_range")
+            else:
+                conf = round(conf_raw * 2) / 2.0
+        except (TypeError, ValueError, KeyError):
+            schema_valid = False
+            dropped.append("domain_confidence:missing")
+
+        out[pid] = PaperValidation(
+            raw_response=raw_text,
+            json_valid=True,
+            schema_valid=schema_valid,
+            dropped_values=dropped,
+            application_domain=list(app_dom) if isinstance(app_dom, list) else None,
+            audience_relevance=list(audience) if isinstance(audience, list) else None,
+            paper_kind=paper_kind or None,
+            geography_focus=geography or None,
+            domain_confidence=conf,
+            exclusivity_violation=exclusivity,
+        )
+
+    for pid in expected_ids - parsed_ids:
+        out[pid] = PaperValidation(
+            raw_response=raw_text,
+            json_valid=True,
+            schema_valid=False,
+            dropped_values=["missing_paper_id"],
+        )
     return out
 
 
-# ---------------------------------------------------------------------------
-# Metrics (report)
-# ---------------------------------------------------------------------------
+def count_exclusivity_violations(application_domain: list[str] | None) -> int:
+    if not application_domain:
+        return 0
+    return 1 if "general_method" in application_domain and len(application_domain) > 1 else 0
 
 
-def is_force_fit(model_apps: list[str] | None, human_general: bool) -> bool:
-    """Model assigned a specific sector but human said general-method."""
-    if human_general:
-        if not model_apps:
-            return False
-        return not is_general_method(model_apps)
-    return False
+def is_general_method(domains: list[str] | None) -> bool:
+    return bool(domains) and len(domains) == 1 and domains[0] == "general_method"
 
 
-def compute_force_fit_rate(
-    model_rows: dict[int, dict],
-    human_labels: dict[int, dict],
-) -> float:
-    n = 0
+def is_force_fit(model_domains: list[str] | None, human_general: bool) -> bool:
+    """Model assigned a specific sector but human said general_method."""
+    if not human_general:
+        return False
+    if not model_domains:
+        return False
+    return not is_general_method(model_domains)
+
+
+def compute_force_fit_rate(model_by_id: dict[int, dict], human_by_id: dict[int, dict]) -> float:
     hits = 0
-    for cid, human in human_labels.items():
-        if cid not in model_rows or model_rows[cid] is None:
+    n = 0
+    for cid, human in human_by_id.items():
+        if cid not in model_by_id:
             continue
+        human_general = is_general_method(human.get("application_domain"))
         n += 1
-        human_gm = bool(human.get("is_general_method"))
-        model_apps = model_rows[cid].get("application_domains") or []
-        if is_force_fit(model_apps, human_gm):
+        if is_force_fit(model_by_id[cid].get("application_domain"), human_general):
             hits += 1
-    return (hits / n) if n else 0.0
+    return hits / n if n else 0.0
 
 
-def compute_accuracy(
-    model_rows: dict[int, dict],
-    human_labels: dict[int, dict],
+def self_consistency_rate(pass1: dict[int, dict], pass2: dict[int, dict]) -> float:
+    """Agreement on application_domain between passes, keyed by content_id."""
+    common = set(pass1.keys()) & set(pass2.keys())
+    if not common:
+        return 0.0
+    agree = sum(
+        1
+        for cid in common
+        if (pass1[cid].get("application_domain") or []) == (pass2[cid].get("application_domain") or [])
+    )
+    return agree / len(common)
+
+
+def call_classify_batch_bakeoff(
+    papers: list[dict],
     *,
-    field: str = "domain",
-) -> float:
+    candidate: BakeoffCandidate,
+    client=None,
+    on_rate_limited=None,
+) -> dict:
+    if client is None:
+        client = create_llm_client()
+    user_prompt = build_quality_batch_user_prompt(papers)
+    expected_ids = {int(p["content_id"]) for p in papers}
+    result = call_chat_completion(
+        client,
+        model=candidate.model,
+        system_prompt=CLASSIFY_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        reasoning_effort=reasoning_effort_for(candidate),
+        temperature=0.0,
+        max_retries=1,
+        request_sleep=0.2,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "classify_assessment",
+                "strict": True,
+                "schema": CLASSIFY_RESPONSE_SCHEMA,
+            },
+        },
+        on_rate_limited=on_rate_limited,
+    )
+    return {
+        "text": result["text"],
+        "input_tokens": result["input_tokens"],
+        "output_tokens": result["output_tokens"],
+        "response_id": result["response_id"],
+    }
+
+
+def classify_batch_with_retries(
+    papers: list[dict],
+    *,
+    candidate: BakeoffCandidate,
+    client=None,
+    max_retries: int = 3,
+) -> tuple[dict[int, PaperValidation], int, bool, int, int, int]:
+    """Returns validations, retries, json_valid_first_try, tokens_in, tokens_out, latency_ms."""
+    last_raw = ""
+    retries = 0
+    json_valid_first_try = False
+    start = time.perf_counter()
+    tokens_in = tokens_out = 0
+    expected_ids = {int(p["content_id"]) for p in papers}
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = call_classify_batch_bakeoff(papers, candidate=candidate, client=client)
+            last_raw = result["text"]
+            tokens_in = int(result["input_tokens"] or 0)
+            tokens_out = int(result["output_tokens"] or 0)
+            if attempt == 1:
+                try:
+                    json.loads(strip_json_fences(last_raw))
+                    json_valid_first_try = True
+                except json.JSONDecodeError:
+                    json_valid_first_try = False
+            validations = analyze_raw_classify_response(last_raw, expected_ids)
+            if all(v.schema_valid for v in validations.values()):
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                return validations, retries, json_valid_first_try, tokens_in, tokens_out, latency_ms
+            retries = attempt
+        except (LLMBatchError, ClassifyParseError) as exc:
+            retries = attempt
+            log.warning("bakeoff batch attempt %s failed: %s", attempt, exc)
+            if attempt >= max_retries:
+                break
+            time.sleep(min(60.0, 2 ** (attempt - 1)))
+
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    validations = analyze_raw_classify_response(last_raw or "", expected_ids)
+    return validations, retries, json_valid_first_try, tokens_in, tokens_out, latency_ms
+
+
+def persist_bakeoff_run(conn, run_id: UUID, *, seed: int, sample_size: int, prompt_version: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO research_radar.bakeoff_runs (run_id, sample_seed, sample_size, prompt_version)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (run_id) DO NOTHING
+        """,
+        (str(run_id), seed, sample_size, prompt_version),
+    )
+
+
+def insert_bakeoff_result(
+    conn,
+    *,
+    run_id: UUID,
+    candidate: BakeoffCandidate,
+    content_id: int,
+    pass_index: int,
+    validation: PaperValidation,
+    retries: int,
+    tokens_in: int,
+    tokens_out: int,
+    latency_ms: int,
+) -> None:
+    cost = cost_from_tokens(
+        tokens_in,
+        tokens_out,
+        input_cost_per_million=candidate.input_cost_per_million,
+        output_cost_per_million=candidate.output_cost_per_million,
+    )
+    conn.execute(
+        """
+        INSERT INTO research_radar.bakeoff_results (
+            run_id, candidate_id, model, content_id, pass_index,
+            application_domain, audience_relevance, paper_kind, geography_focus, domain_confidence,
+            raw_response, json_valid, schema_valid, dropped_values,
+            retries, tokens_in, tokens_out, cost_usd, latency_ms
+        ) VALUES (
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s, %s
+        )
+        ON CONFLICT (run_id, candidate_id, content_id, pass_index) DO UPDATE SET
+            model = EXCLUDED.model,
+            application_domain = EXCLUDED.application_domain,
+            audience_relevance = EXCLUDED.audience_relevance,
+            paper_kind = EXCLUDED.paper_kind,
+            geography_focus = EXCLUDED.geography_focus,
+            domain_confidence = EXCLUDED.domain_confidence,
+            raw_response = EXCLUDED.raw_response,
+            json_valid = EXCLUDED.json_valid,
+            schema_valid = EXCLUDED.schema_valid,
+            dropped_values = EXCLUDED.dropped_values,
+            retries = EXCLUDED.retries,
+            tokens_in = EXCLUDED.tokens_in,
+            tokens_out = EXCLUDED.tokens_out,
+            cost_usd = EXCLUDED.cost_usd,
+            latency_ms = EXCLUDED.latency_ms
+        """,
+        (
+            str(run_id),
+            candidate.id,
+            candidate.model,
+            content_id,
+            pass_index,
+            validation.application_domain,
+            validation.audience_relevance,
+            validation.paper_kind,
+            validation.geography_focus,
+            validation.domain_confidence,
+            validation.raw_response,
+            validation.json_valid,
+            validation.schema_valid,
+            validation.dropped_values,
+            retries,
+            tokens_in,
+            tokens_out,
+            cost,
+            latency_ms,
+        ),
+    )
+
+
+def import_haiku_baseline(
+    conn,
+    run_id: UUID,
+    sample: list[dict],
+    *,
+    candidate_id: str = BASELINE_CANDIDATE_ID,
+    model: str = "anthropic/claude-haiku-4.5",
+) -> int:
+    """Import existing content_classifications rows into bakeoff_results — no API calls."""
     n = 0
-    hits = 0
-    for cid, human in human_labels.items():
-        if cid not in model_rows or model_rows[cid] is None:
-            continue
+    for paper in sample:
+        raw = reconstruct_raw_response(paper)
+        validation = analyze_raw_classify_response(raw, {int(paper["content_id"])})[int(paper["content_id"])]
+        candidate = BakeoffCandidate(id=candidate_id, model=model, reasoning="disabled")
+        insert_bakeoff_result(
+            conn,
+            run_id=run_id,
+            candidate=candidate,
+            content_id=int(paper["content_id"]),
+            pass_index=1,
+            validation=validation,
+            retries=0,
+            tokens_in=0,
+            tokens_out=0,
+            latency_ms=0,
+        )
         n += 1
-        if model_rows[cid].get(field) == human.get(field):
-            hits += 1
-    return (hits / n) if n else 0.0
+    return n
 
 
-def compute_general_method_rate(model_rows: dict[int, dict]) -> float:
-    n = len(model_rows)
-    if not n:
-        return 0.0
-    hits = sum(1 for r in model_rows.values() if r and is_general_method(r.get("application_domains")))
-    return hits / n
+def load_sample_papers(conn, run_id: UUID) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT br.content_id, ci.title,
+               COALESCE(pm.categories, ci.categories_raw, '[]'::jsonb) AS categories,
+               COALESCE(pm.abstract, ci.summary, '') AS abstract
+        FROM research_radar.bakeoff_results br
+        JOIN research_radar.content_items ci ON ci.id = br.content_id
+        LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
+        WHERE br.run_id = %s AND br.candidate_id = %s AND br.pass_index = 1
+        ORDER BY br.content_id
+        """,
+        (str(run_id), BASELINE_CANDIDATE_ID),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
-def compute_valid_json_rate(results: list[dict]) -> float:
+def load_results_for_run(conn, run_id: UUID, candidate_id: str | None = None) -> list[dict]:
+    params: list[Any] = [str(run_id)]
+    sql = """
+        SELECT * FROM research_radar.bakeoff_results
+        WHERE run_id = %s
+    """
+    if candidate_id:
+        sql += " AND candidate_id = %s"
+        params.append(candidate_id)
+    sql += " ORDER BY candidate_id, content_id, pass_index"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def load_human_labels(conn, run_id: UUID) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT * FROM research_radar.bakeoff_labels
+        WHERE run_id = %s
+        ORDER BY content_id, labeller
+        """,
+        (str(run_id),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def estimate_bakeoff_run_cost(config: BakeoffConfig, n_papers: int, n_passes: int = 2) -> dict[str, Any]:
+    """Token-based estimate for non-baseline candidates (no API calls)."""
+    per_paper_in = 550
+    per_paper_out = 80
+    batches_per_pass = max(1, (n_papers + config.batch_size - 1) // config.batch_size)
+    by_candidate = {}
+    total = 0.0
+    for cand in config.candidates:
+        if cand.id == config.baseline_candidate_id:
+            continue
+        tin = per_paper_in * n_papers * n_passes
+        tout = per_paper_out * n_papers * n_passes
+        cost = cost_from_tokens(
+            tin,
+            tout,
+            input_cost_per_million=cand.input_cost_per_million,
+            output_cost_per_million=cand.output_cost_per_million,
+        )
+        by_candidate[cand.id] = {
+            "model": cand.model,
+            "papers": n_papers,
+            "passes": n_passes,
+            "batches_per_pass": batches_per_pass,
+            "estimated_cost_usd": round(cost, 2),
+        }
+        total += cost
+    return {
+        "n_papers": n_papers,
+        "n_passes": n_passes,
+        "non_baseline_candidates": len(by_candidate),
+        "by_candidate": by_candidate,
+        "total_estimated_cost_usd": round(total, 2),
+    }
+
+
+def compute_candidate_metrics(
+    results: list[dict],
+    labels: list[dict],
+    *,
+    input_cost_per_million: float,
+    output_cost_per_million: float,
+) -> dict[str, Any]:
     if not results:
-        return 0.0
-    return sum(1 for r in results if r.get("json_valid_first_try")) / len(results)
+        return {}
+    n = len(results)
+    general_method_n = sum(1 for r in results if is_general_method(r.get("application_domain")))
+    exclusivity = sum(count_exclusivity_violations(r.get("application_domain")) for r in results)
+    json_valid = sum(1 for r in results if r.get("json_valid"))
+    schema_valid = sum(1 for r in results if r.get("schema_valid"))
+    first_try = sum(1 for r in results if r.get("json_valid") and int(r.get("retries") or 0) == 0)
+    invalid_raw = sum(
+        1
+        for r in results
+        if not r.get("schema_valid") and any(
+            "invalid" in (dv or "") for dv in (r.get("dropped_values") or [])
+        )
+    )
+    latencies = [int(r["latency_ms"]) for r in results if r.get("latency_ms")]
+    cost_per_1k = cost_per_thousand_from_measured(
+        results,
+        input_cost_per_million=input_cost_per_million,
+        output_cost_per_million=output_cost_per_million,
+    )
 
-
-def inter_labeller_agreement(labels: list[dict], field: str = "domain") -> float:
-    """Pairwise agreement across labellers for the same content_id."""
-    by_cid: dict[int, list[str]] = {}
+    human_by_id: dict[int, dict] = {}
     for row in labels:
         cid = int(row["content_id"])
-        val = row.get(field)
-        if val is None or (isinstance(val, str) and not val.strip()):
-            continue
-        by_cid.setdefault(cid, []).append(str(val))
-    if not by_cid:
-        return 0.0
-    scores = []
-    for vals in by_cid.values():
-        if len(vals) < 2:
-            continue
-        agree = sum(1 for i in range(len(vals)) for j in range(i + 1, len(vals)) if vals[i] == vals[j])
-        pairs = len(vals) * (len(vals) - 1) // 2
-        scores.append(agree / pairs if pairs else 0.0)
-    return sum(scores) / len(scores) if scores else 0.0
+        human_by_id.setdefault(cid, row)
 
+    model_by_id = {int(r["content_id"]): r for r in results}
+    force_fit = compute_force_fit_rate(model_by_id, human_by_id) if human_by_id else None
 
-def group_disagreements_by_pattern(disagreements: list[dict]) -> dict[str, list[dict]]:
-    """Group human reasoning by failure pattern keyword buckets."""
-    buckets: dict[str, list[dict]] = {
-        "force_fitting": [],
-        "domain_mismatch": [],
-        "audience_mismatch": [],
-        "other": [],
+    accuracy = None
+    if human_by_id:
+        agree = 0
+        labelled = 0
+        for cid, human in human_by_id.items():
+            if cid not in model_by_id:
+                continue
+            labelled += 1
+            if (model_by_id[cid].get("application_domain") or []) == (human.get("application_domain") or []):
+                agree += 1
+        accuracy = agree / labelled if labelled else None
+
+    return {
+        "n": n,
+        "general_method_rate": round(general_method_n / n, 4) if n else 0.0,
+        "force_fit_rate": round(force_fit, 4) if force_fit is not None else None,
+        "exclusivity_violations": exclusivity,
+        "invalid_rate": round(invalid_raw / n, 4) if n else 0.0,
+        "valid_json_rate": round(first_try / n, 4) if n else 0.0,
+        "schema_valid_rate": round(schema_valid / n, 4) if n else 0.0,
+        "accuracy": round(accuracy, 4) if accuracy is not None else None,
+        "cost_per_1000": cost_per_1k,
+        "mean_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else None,
     }
-    for row in disagreements:
-        reason = (row.get("reasoning") or "").lower()
-        if "general" in reason or "force" in reason or "sector" in reason:
-            buckets["force_fitting"].append(row)
-        elif "domain" in reason:
-            buckets["domain_mismatch"].append(row)
-        elif "audience" in reason:
-            buckets["audience_mismatch"].append(row)
-        else:
-            buckets["other"].append(row)
-    return buckets
 
 
-def new_run_id() -> UUID:
-    return uuid4()
+def candidate_disagreement_rows(results: list[dict]) -> set[int]:
+    """Papers where candidates disagree on general_method vs specific, or on domains."""
+    by_paper: dict[int, list[set[str]]] = {}
+    for r in results:
+        if int(r.get("pass_index") or 1) != 1:
+            continue
+        cid = int(r["content_id"])
+        domains = tuple(sorted(r.get("application_domain") or []))
+        by_paper.setdefault(cid, []).append(set(domains))
+
+    disagreements: set[int] = set()
+    for cid, domain_sets in by_paper.items():
+        if len(domain_sets) < 2:
+            continue
+        gm_flags = {is_general_method(sorted(s)) for s in domain_sets}
+        if len(gm_flags) > 1:
+            disagreements.add(cid)
+            continue
+        if len({tuple(sorted(s)) for s in domain_sets}) > 1:
+            disagreements.add(cid)
+    return disagreements
+
+
+def agreement_control_ids(results: list[dict], *, seed: int, n: int = 30) -> list[int]:
+    by_paper: dict[int, list[set[str]]] = {}
+    for r in results:
+        if int(r.get("pass_index") or 1) != 1:
+            continue
+        cid = int(r["content_id"])
+        by_paper.setdefault(cid, []).append(set(r.get("application_domain") or []))
+    unanimous = [cid for cid, sets in by_paper.items() if len({tuple(sorted(s)) for s in sets}) == 1]
+    rng = random.Random(seed)
+    rng.shuffle(unanimous)
+    return unanimous[:n]

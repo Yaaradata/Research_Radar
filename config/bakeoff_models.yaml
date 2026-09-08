@@ -1,0 +1,37 @@
+# Classification bake-off candidates — same classify prompt, non-reasoning only.
+# reasoning: disabled omits the reasoning extra_body; minimum clamps where required.
+
+candidates:
+  - id: haiku
+    model: anthropic/claude-haiku-4.5
+    reasoning: disabled
+    input_cost_per_million: 1.00
+    output_cost_per_million: 5.00
+
+  - id: gpt-4o-mini
+    model: openai/gpt-4o-mini
+    reasoning: disabled
+    input_cost_per_million: 0.15
+    output_cost_per_million: 0.60
+
+  - id: gemini-flash
+    model: google/gemini-3.8-flash
+    reasoning: disabled
+    input_cost_per_million: 0.75
+    output_cost_per_million: 3.75
+
+  - id: qwen-max
+    model: qwen/qwen3.8-max-0902
+    reasoning: disabled
+    input_cost_per_million: 2.00
+    output_cost_per_million: 6.00
+
+batch_size: 15
+sample_size: 400
+sample_seed: 20260907
+
+# Haiku baseline pool: already classified under this prompt_version in this window.
+baseline_prompt_version: research-classify-v1
+baseline_date_from: 2026-09-01
+baseline_date_until: 2026-09-04
+baseline_candidate_id: haiku

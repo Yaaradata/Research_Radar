@@ -211,16 +211,16 @@ def test_reconstruct_raw_response_roundtrip():
     assert parsed.application_domain == ["general_method"]
 
 
-def test_estimate_bakeoff_cost_three_candidates_two_passes():
+def test_estimate_bakeoff_cost_non_baseline_candidates_two_passes():
     config = load_bakeoff_config()
     est = estimate_bakeoff_run_cost(config, 400, n_passes=2)
-    assert est["non_baseline_candidates"] == 3
+    assert est["non_baseline_candidates"] == 5
     assert est["total_estimated_cost_usd"] > 0
-    assert len(est["by_candidate"]) == 3
+    assert len(est["by_candidate"]) == 5
 
 
 def test_load_config_matches_spec_candidates():
     config = load_bakeoff_config()
     ids = {c.id for c in config.candidates}
-    assert ids == {"haiku", "gpt-4o-mini", "gemini-flash", "qwen-max"}
+    assert ids == {"haiku", "gpt-4o-mini", "gemini-flash", "glm-flash", "gpt-luna", "qwen-max"}
     assert config.batch_size == 15

@@ -61,6 +61,7 @@ PIPELINE_WORKERS = int(os.getenv("PIPELINE_WORKERS", str(ARXIV_WORKERS)))
 MIN_AI_RELEVANCE = float(os.getenv("MIN_AI_RELEVANCE_FOR_ENRICHMENT", "5.0"))
 MIN_CANDIDATE_SCORE = float(os.getenv("MIN_INTRINSIC_CANDIDATE_SCORE", "5.5"))
 SCORE_INCLUDE_PERSON_SIGNAL = os.getenv("SCORE_INCLUDE_PERSON_SIGNAL", "auto").strip().lower()
+RELEVANCE_VERSION = os.getenv("RELEVANCE_VERSION", "relevance-v1")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("research-radar")
@@ -389,7 +390,9 @@ def timestamps_from_inoreader_raw(raw_metadata):
     return published_at, source_seen_at, updated_at
 
 
-def lookback_cutoff():
+def lookback_cutoff(cutoff: datetime | None = None):
+    if cutoff is not None:
+        return cutoff
     days = max(1, INOREADER_LOOKBACK_DAYS)
     return datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -425,8 +428,8 @@ def inoreader_item_to_canonical(item):
     }
 
 
-def fetch_inoreader_items():
-    cutoff = lookback_cutoff()
+def fetch_inoreader_items(cutoff=None):
+    cutoff = lookback_cutoff(cutoff)
     cutoff_usec = int(cutoff.timestamp() * 1_000_000)
     log.info(
         "Inoreader lookback_days=%s cutoff_utc=%s cutoff_usec=%s",
@@ -577,6 +580,14 @@ def bump(conn,run_id,field,amount=1):
 
 def set_status(conn,content_id,status):
     with conn.cursor() as cur: cur.execute("UPDATE research_radar.content_items SET status=%s,modified_at=NOW() WHERE id=%s",(status,content_id))
+
+
+def set_relevance_version(conn, content_id, version):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE research_radar.content_items SET relevance_version=%s, modified_at=NOW() WHERE id=%s",
+            (version, content_id),
+        )
 
 
 def event(conn,run_id,content_id,stage,event_type,success,details=None,error=None):
@@ -1132,15 +1143,47 @@ def print_status_counts(conn):
     log.info("DB status counts: %s", summary)
 
 
-def stage_ingest(conn, run_id, limit=None):
-    items = fetch_inoreader_items()
+def stage_ingest(conn, run_id, limit=None, *, resume=False):
+    from research_radar.archive import archive_raw
+    from research_radar.pull_state import (
+        SOURCE_INOREADER,
+        format_resume_banner,
+        get_pull_state,
+        mark_run_completed,
+        mark_run_started,
+        resume_cutoff,
+        track_newest_published,
+    )
+
+    mark_run_started(conn, SOURCE_INOREADER, run_id)
+    conn.commit()
+
+    if resume:
+        cutoff = resume_cutoff(conn, SOURCE_INOREADER)
+        if cutoff is None:
+            cutoff = lookback_cutoff()
+        state = get_pull_state(conn, SOURCE_INOREADER)
+        banner = format_resume_banner(SOURCE_INOREADER, state, cutoff)
+        log.info(banner)
+        print(banner)
+    else:
+        cutoff = lookback_cutoff()
+
+    items = fetch_inoreader_items(cutoff=cutoff)
     if limit is not None:
         items = items[:limit]
+
+    archive_raw(conn, run_id, "inoreader", items, window_from=cutoff)
+
     bump(conn, run_id, "items_received", len(items))
     log.info("Ingest: received %d items from Inoreader/fixture", len(items))
+    newest_pub: tuple[datetime | None, str | None] = (None, None)
     for i, item in enumerate(items, 1):
         content_id, is_new = upsert_item(conn, item)
         bump(conn, run_id, "items_new" if is_new else "items_duplicate")
+        newest_pub = track_newest_published(
+            newest_pub, item.get("published_at"), item.get("source_external_id"),
+        )
         if is_new:
             set_status(conn, content_id, "INGESTED")
             event(conn, run_id, content_id, "ingest", "upsert", True, {"title": item.get("title"), "is_new": True})
@@ -1165,6 +1208,15 @@ def stage_ingest(conn, run_id, limit=None):
             )
         if i % 25 == 0 or i == len(items):
             log.info("Ingest progress %d/%d last_id=%s title=%s", i, len(items), content_id, (item.get("title") or "")[:80])
+
+    mark_run_completed(
+        conn,
+        SOURCE_INOREADER,
+        run_id=run_id,
+        last_published_at=newest_pub[0],
+        last_external_id=newest_pub[1],
+        items_last_run=len(items),
+    )
     return len(items)
 
 
@@ -1228,18 +1280,32 @@ def stage_repair_timestamps(conn, run_id, limit=None):
     return updated
 
 
-def stage_relevance(conn, run_id, limit=None):
+def stage_relevance(conn, run_id, limit=None, *, reprocess_version: str | None = None):
+    from research_radar.archive import archive_rejected, build_rejected_record
+
+    statuses = "('INGESTED', 'RELEVANCE_CHECKED', 'ERROR')"
+    if reprocess_version:
+        statuses = "('INGESTED', 'RELEVANCE_CHECKED', 'ERROR', 'REJECTED')"
     rows = conn.execute(
-        """
-        SELECT id, title, summary, categories_raw, source_type
-        FROM research_radar.content_items
-        WHERE status IN ('INGESTED', 'RELEVANCE_CHECKED', 'ERROR')
-        ORDER BY id
+        f"""
+        SELECT id, title, summary, categories_raw, source_type,
+               canonical_url,
+               COALESCE(pm.arxiv_id, NULL) AS arxiv_id,
+               COALESCE(pm.abstract, ci.summary, '') AS abstract
+        FROM research_radar.content_items ci
+        LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
+        WHERE ci.status IN {statuses}
+        ORDER BY ci.id
         LIMIT %s
         """,
         (limit or 10_000,),
     ).fetchall()
-    log.info("Relevance: processing %d items", len(rows))
+    if reprocess_version:
+        rows = [r for r in rows if r.get("relevance_version") is None or r["relevance_version"] != reprocess_version or r.get("status") == "REJECTED"][:limit or 10_000]
+    log.info("Relevance: processing %d items (reprocess_version=%s)", len(rows), reprocess_version)
+
+    reject_records = []
+    reject_ids = []
     for i, row in enumerate(rows, 1):
         try:
             score, primary, secondary, reason = score_relevance(
@@ -1247,9 +1313,22 @@ def stage_relevance(conn, run_id, limit=None):
             )
             store_relevance(conn, row["id"], score, primary, secondary, reason)
             set_status(conn, row["id"], "RELEVANCE_CHECKED")
+            set_relevance_version(conn, row["id"], reprocess_version or RELEVANCE_VERSION)
             event(conn, run_id, row["id"], "relevance", "deterministic_relevance", True, {"score": score, "primary_topic": primary, "reason": reason})
             if score < MIN_AI_RELEVANCE:
-                set_status(conn, row["id"], "REJECTED")
+                reject_records.append(build_rejected_record(
+                    content_id=row["id"],
+                    canonical_url=row.get("canonical_url") or "",
+                    title=row["title"] or "",
+                    abstract=row.get("abstract") or row.get("summary") or "",
+                    categories=row.get("categories_raw") or [],
+                    relevance_score=score,
+                    primary_topic=primary,
+                    rejection_reason="low_ai_relevance",
+                    relevance_version=reprocess_version or RELEVANCE_VERSION,
+                    arxiv_id=row.get("arxiv_id"),
+                ))
+                reject_ids.append(row["id"])
                 log.info("Relevance REJECTED id=%s score=%.2f title=%s", row["id"], score, (row["title"] or "")[:80])
             else:
                 bump(conn, run_id, "items_relevant")
@@ -1262,6 +1341,12 @@ def stage_relevance(conn, run_id, limit=None):
             event(conn, run_id, row["id"], "relevance", "processing_error", False, {"title": row.get("title")}, str(exc))
         if i % 25 == 0 or i == len(rows):
             log.info("Relevance progress %d/%d", i, len(rows))
+
+    if reject_records:
+        archive_rejected(conn, run_id, "relevance", reject_records)
+    for cid in reject_ids:
+        set_status(conn, cid, "REJECTED")
+
     return len(rows)
 
 
@@ -2080,6 +2165,8 @@ def run_stage(
     gate_percentile=None,
     date_from=None,
     date_until=None,
+    resume=False,
+    reprocess_version=None,
 ):
     if stage in PAID_STAGES and not dry_run and not allow_paid:
         raise PaidStageNotAuthorised(
@@ -2093,9 +2180,9 @@ def run_stage(
         try:
             print_status_counts(conn)
             if stage == "ingest":
-                stage_ingest(conn, run_id, limit=limit)
+                stage_ingest(conn, run_id, limit=limit, resume=resume)
             elif stage == "relevance":
-                stage_relevance(conn, run_id, limit=limit)
+                stage_relevance(conn, run_id, limit=limit, reprocess_version=reprocess_version)
             elif stage == "enrich":
                 stage_enrich(conn, run_id, limit=limit)
             elif stage == "entities":
@@ -2237,8 +2324,23 @@ def run_stage(
                     print(md)
             elif stage == "arxiv-backfill":
                 from research_radar.arxiv_backfill import stage_arxiv_backfill
+                from research_radar.pull_state import (
+                    SOURCE_ARXIV_OAI,
+                    mark_run_completed,
+                    mark_run_started,
+                    resume_cutoff as _resume_cutoff,
+                )
 
-                stage_arxiv_backfill(
+                if resume and date_from is None:
+                    rc = _resume_cutoff(conn, SOURCE_ARXIV_OAI)
+                    if rc is not None:
+                        date_from = rc.date()
+                        log.info("arxiv-backfill: --resume resolved date_from=%s", date_from)
+
+                mark_run_started(conn, SOURCE_ARXIV_OAI, run_id)
+                conn.commit()
+
+                totals = stage_arxiv_backfill(
                     conn,
                     run_id,
                     date_from=date_from,
@@ -2246,6 +2348,16 @@ def run_stage(
                     dry_run=dry_run,
                     force=force,
                 )
+
+                if not dry_run and hasattr(totals, "records_kept"):
+                    mark_run_completed(
+                        conn,
+                        SOURCE_ARXIV_OAI,
+                        run_id=run_id,
+                        last_published_at=None,
+                        last_external_id=None,
+                        items_last_run=totals.records_kept,
+                    )
             elif stage == "all":
                 # `all` is the free/unattended path. Paid stages (affiliation-gpt,
                 # screen, semantic-score, independence — run in that order) are
@@ -2254,8 +2366,8 @@ def run_stage(
                 # (brief §7) — it stays available via --stage score for
                 # manual/legacy use, but final ranking now comes from
                 # screen -> semantic-score -> independence -> final-score.
-                stage_ingest(conn, run_id, limit=limit)
-                stage_relevance(conn, run_id, limit=limit)
+                stage_ingest(conn, run_id, limit=limit, resume=resume)
+                stage_relevance(conn, run_id, limit=limit, reprocess_version=reprocess_version)
                 stage_enrich(conn, run_id, limit=limit)
                 stage_entities(conn, run_id, limit=limit)
             else:
@@ -2302,6 +2414,7 @@ def main():
             "arxiv-backfill",
             "topics",
             "corpus-search",
+            "pull-status",
             "all",
         ],
         default="all",
@@ -2382,6 +2495,16 @@ def main():
         default=None,
         help="arxiv-backfill: end date (inclusive), ISO YYYY-MM-DD",
     )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="ingest: resume from pull_state watermark; arxiv-backfill: resolve --from from pull_state if not given",
+    )
+    ap.add_argument(
+        "--reprocess-version",
+        default=None,
+        help="relevance: re-score REJECTED rows with a distinct relevance_version tag",
+    )
     ap.add_argument("--tag", default=None, help="corpus-search: filter by level-3 topic (canonical name or alias)")
     ap.add_argument("--subdomain", default=None, help="corpus-search: filter by subdomain")
     ap.add_argument("--application", default=None, help="corpus-search: filter by application")
@@ -2396,6 +2519,25 @@ def main():
 
     if args.stage == "show":
         print_top_candidates(args.top)
+        return
+
+    if args.stage == "pull-status":
+        from research_radar.pull_state import list_pull_states
+
+        with connect() as conn:
+            states = list_pull_states(conn)
+        if not states:
+            print("No pull state rows yet.")
+        else:
+            fmt = "{:<15} {:<26} {:<26} {:<10} {:<38}"
+            print(fmt.format("source", "last_completed", "last_published", "items", "run_id"))
+            print("-" * 115)
+            for s in states:
+                completed = (s.get("last_run_completed_at") or "").isoformat().replace("+00:00", "Z") if s.get("last_run_completed_at") else "-"
+                published = (s.get("last_published_at") or "").isoformat().replace("+00:00", "Z") if s.get("last_published_at") else "-"
+                items = str(s.get("items_last_run") or "-")
+                rid = str(s.get("last_run_id") or "-")
+                print(fmt.format(s["source"], completed[:26], published[:26], items, rid[:38]))
         return
 
     if args.stage == "corpus-search":
@@ -2437,6 +2579,8 @@ def main():
         gate_percentile=args.gate_percentile,
         date_from=args.date_from,
         date_until=args.date_until,
+        resume=args.resume,
+        reprocess_version=args.reprocess_version,
     )
     print(f"\nSTAGE COMPLETED: {args.stage} run_id={run_id}")
     if args.stage in {"score", "all"}:

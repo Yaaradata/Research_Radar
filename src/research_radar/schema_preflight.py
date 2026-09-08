@@ -185,12 +185,22 @@ MIGRATION_CHECKS: list[SchemaCheck] = [
         lambda c: _column_exists(c, "content_items", "relevance_version"),
     ),
     SchemaCheck(
+        "sql/016_pull_state.sql",
+        "research_radar.pull_state",
+        lambda c: _table_exists(c, "pull_state"),
+    ),
+    SchemaCheck(
         "sql/017_s3_manifest.sql",
         "research_radar.s3_archives",
         lambda c: _table_exists(c, "s3_archives"),
     ),
     SchemaCheck(
-        "sql/018_relevance_version.sql",
+        "sql/018_prompt_registry.sql",
+        "research_radar.prompt_versions",
+        lambda c: _table_exists(c, "prompt_versions"),
+    ),
+    SchemaCheck(
+        "sql/020_relevance_rejected_backfill.sql",
         "research_radar.ix_content_relevance_version (REJECTED backfill index)",
         lambda c: _index_exists(c, "ix_content_relevance_version"),
     ),
@@ -207,6 +217,7 @@ STAGE_REQUIRED_MIGRATIONS: dict[str, tuple[str, ...]] = {
     "relevance": ("sql/015_relevance_version.sql",),
     "classify": ("sql/014_scoring_v3.sql",),
     "topics": ("sql/012_topic_hierarchy.sql", "sql/013_seed_topic_hierarchy.sql"),
+    "pull-status": (),  # free — only reads, table checked at runtime
 }
 
 

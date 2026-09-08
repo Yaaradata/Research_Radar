@@ -1663,6 +1663,77 @@ def select_gated_content_ids(conn, *, gate_percentile: float | None = None) -> l
     return [cid for cid, _ in ranked[:k]]
 
 
+def archive_screen_gate_drops(conn, run_id, gate_percentile: float | None = None):
+    """Compute gated vs dropped content_ids and archive the drops before quality scoring."""
+    from research_radar.archive import archive_rejected
+
+    gate_percentile = GATE_PERCENTILE if gate_percentile is None else gate_percentile
+    rows = conn.execute(
+        """
+        SELECT csa.content_id, csa.ai_relevance, csa.technical_significance,
+               csa.apparent_novelty, csa.evidence_strength,
+               ci.title, ci.canonical_url,
+               COALESCE(pm.abstract, ci.summary, '') AS abstract,
+               COALESCE(pm.categories, ci.categories_raw, '[]'::jsonb) AS categories,
+               pm.arxiv_id
+        FROM research_radar.content_score_assessments csa
+        JOIN research_radar.content_items ci ON ci.id = csa.content_id
+        LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
+        WHERE csa.prompt_version = %s AND csa.scoring_tier = 'screen' AND csa.status = 'COMPLETED'
+        """,
+        (SCREEN_PROMPT_VERSION,),
+    ).fetchall()
+
+    ranked = []
+    dropped_low_ai = []
+    for r in rows:
+        ai_rel = r.get("ai_relevance")
+        if ai_rel is None or float(ai_rel) <= SCREEN_AI_RELEVANCE_FLOOR:
+            dropped_low_ai.append(dict(r))
+            continue
+        dims = [r.get(k) for k in SCREEN_RANKING_FIELDS]
+        if any(d is None for d in dims):
+            continue
+        mean = sum(float(d) for d in dims) / len(dims)
+        ranked.append((dict(r), mean))
+
+    ranked.sort(key=lambda x: (-x[1], x[0]["content_id"]))
+    k = math.ceil(len(ranked) * gate_percentile / 100.0)
+    gated = ranked[:k]
+    gate_dropped = ranked[k:]
+
+    gated_ids = {r["content_id"] for r, _ in gated}
+    drop_records = []
+    for r in dropped_low_ai:
+        drop_records.append({
+            "content_id": r["content_id"],
+            "title": r.get("title") or "",
+            "ai_relevance": float(r.get("ai_relevance") or 0),
+            "technical_significance": float(r.get("technical_significance") or 0),
+            "apparent_novelty": float(r.get("apparent_novelty") or 0),
+            "evidence_strength": float(r.get("evidence_strength") or 0),
+            "rejection_reason": "screen_gate_drop_low_ai",
+        })
+    for r, mean in gate_dropped:
+        drop_records.append({
+            "content_id": r["content_id"],
+            "title": r.get("title") or "",
+            "ai_relevance": float(r.get("ai_relevance") or 0),
+            "technical_significance": float(r.get("technical_significance") or 0),
+            "apparent_novelty": float(r.get("apparent_novelty") or 0),
+            "evidence_strength": float(r.get("evidence_strength") or 0),
+            "screen_mean": round(mean, 4),
+            "rejection_reason": "screen_gate_drop",
+        })
+
+    if drop_records:
+        archive_rejected(conn, run_id, "screen-gate", drop_records)
+        log.info("Screen gate: archived %d drops (%d low-ai, %d below percentile), %d gated",
+                 len(drop_records), len(dropped_low_ai), len(gate_dropped), len(gated))
+
+    return gated_ids, drop_records
+
+
 def load_gated_quality_candidates(
     conn, *, gate_percentile: float | None = None, limit: int | None = None
 ) -> list[dict]:
@@ -1715,6 +1786,15 @@ def stage_semantic_score_v2(
     if not dry_run:
         require_scoring_enabled()
         require_api_key()
+        try:
+            from research_radar.prompt_registry import assert_registered
+            assert_registered(conn, "semantic-score", QUALITY_PROMPT_VERSION, QUALITY_SYSTEM_PROMPT, model_name=resolve_model_name())
+        except Exception as exc:
+            log.warning("prompt registry unavailable: %s", exc)
+        try:
+            archive_screen_gate_drops(conn, run_id, gate_percentile=gate_percentile)
+        except Exception as exc:
+            log.warning("archive_screen_gate_drops failed (non-fatal): %s", exc)
 
     candidates = load_gated_quality_candidates(conn, gate_percentile=gate_percentile)
     if not force:
@@ -2237,6 +2317,11 @@ def stage_screen(
     if not dry_run:
         require_scoring_enabled()
         require_api_key()
+        try:
+            from research_radar.prompt_registry import assert_registered
+            assert_registered(conn, "screen", SCREEN_PROMPT_VERSION, SCREEN_SYSTEM_PROMPT, model_name=resolve_screen_model())
+        except Exception as exc:
+            log.warning("prompt registry unavailable: %s", exc)
 
     candidates = load_quality_candidates(conn, limit=limit)
     if not force:

@@ -83,6 +83,7 @@ class BakeoffCandidate:
     reasoning: str
     input_cost_per_million: float = 1.0
     output_cost_per_million: float = 5.0
+    comparable: bool = True
 
 
 @dataclass
@@ -133,6 +134,7 @@ def load_bakeoff_config(path: Path | None = None) -> BakeoffConfig:
             reasoning=str(c.get("reasoning", "disabled")),
             input_cost_per_million=float(c.get("input_cost_per_million", 1.0)),
             output_cost_per_million=float(c.get("output_cost_per_million", 5.0)),
+            comparable=bool(c.get("comparable", True)),
         )
         for c in raw["candidates"]
     ]

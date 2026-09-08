@@ -59,8 +59,11 @@ def build_report(run_id: UUID, results: list[dict], labels: list[dict], config) 
         sc = self_consistency_rate(p1, p2) if p2 else None
         metrics["self_consistency"] = round(sc, 4) if sc is not None else None
         per_candidate[cid] = metrics
+        note = ""
+        if cfg is not None and not getattr(cfg, "comparable", True):
+            note = " ⚠️ non-comparable (reasoning-class latency; excluded from decision)"
         lines.append(
-            f"| {cid} | {_fmt(metrics.get('accuracy'))} | {_fmt(metrics.get('general_method_rate'))} | "
+            f"| {cid}{note} | {_fmt(metrics.get('accuracy'))} | {_fmt(metrics.get('general_method_rate'))} | "
             f"{_fmt(metrics.get('force_fit_rate'))} | {metrics.get('exclusivity_violations', 0)} | "
             f"{_fmt(metrics.get('invalid_rate'))} | {_fmt(metrics.get('valid_json_rate'))} | "
             f"{_fmt(metrics.get('self_consistency'))} | {_fmt(metrics.get('cost_per_1000'))} | "

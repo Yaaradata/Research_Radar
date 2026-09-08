@@ -397,6 +397,11 @@ def stage_classify(
     if not dry_run:
         require_scoring_enabled()
         require_api_key()
+        try:
+            from research_radar.prompt_registry import assert_registered
+            assert_registered(conn, "classify", CLASSIFY_PROMPT_VERSION, CLASSIFY_SYSTEM_PROMPT, model_name=resolve_screen_model())
+        except Exception as exc:
+            log.warning("prompt registry unavailable: %s", exc)
 
     candidates = load_quality_candidates(conn, limit=limit)
     if not force:

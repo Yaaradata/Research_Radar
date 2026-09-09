@@ -20,5 +20,9 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/013_seed_topic_hierarchy.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/014_scoring_v3.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/015_general_method_application.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/015_relevance_version.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/016_pull_state.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/017_s3_manifest.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/018_prompt_registry.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/019_bakeoff.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/020_relevance_rejected_backfill.sql
 echo "research_radar schema + watchlists installed."

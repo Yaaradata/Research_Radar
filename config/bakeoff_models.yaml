@@ -14,15 +14,33 @@ candidates:
     input_cost_per_million: 0.15
     output_cost_per_million: 0.60
 
+  - id: glm-flash
+    model: z-ai/glm-5.3-flash
+    reasoning: disabled
+    input_cost_per_million: 0.075
+    output_cost_per_million: 0.25
+
   - id: gemini-flash
     model: google/gemini-3.8-flash
     reasoning: disabled
     input_cost_per_million: 0.75
     output_cost_per_million: 3.75
 
+  # OpenRouter does NOT list openai/gpt-luna (verified 2026-09-08).
+  # Closest match is openai/gpt-5.6-luna — do not silently substitute; leave
+  # unresolved until the exact id is confirmed. bakeoff_run aborts paid runs
+  # when the model is missing from OpenRouter.
+  - id: gpt-luna
+    model: openai/gpt-luna
+    reasoning: disabled
+    input_cost_per_million: 0.20
+    output_cost_per_million: 1.20
+
+  # Previously run; high latency (~14s) — treat as non-comparable to non-reasoning field.
   - id: qwen-max
     model: qwen/qwen3.8-max-0902
     reasoning: disabled
+    comparable: false
     input_cost_per_million: 2.00
     output_cost_per_million: 6.00
 

@@ -66,7 +66,8 @@ Stages (run in this order):
                  --allow-paid). Annotation only, NOT scoring: runs on every
                  RELEVANT-or-later paper, never changes content_items.status,
                  not in `all`. --dry-run projects cost with zero calls/writes.
- 14) corpus-search     Free, pure-SQL query over topics/claims (FREE, explicit,
+ 14) pull-status       Show last run / watermark per source (FREE, no DB writes)
+ 15) corpus-search     Free, pure-SQL query over topics/claims (FREE, explicit,
                  not in `all`). --tag/--subdomain/--application/--domain/--since
                  filter (AND); --list-topics audits the tag vocabulary;
                  --claims-for lists claims for a metric; --json/--out for output.
@@ -95,8 +96,11 @@ Examples:
   ./scripts/run_stage.sh report --top 20 --out reports/research-radar-top20.md
   ./scripts/run_stage.sh report --top 20 --since-days 30 --out reports/top20-30d.md
   ./scripts/run_stage.sh show --top 10
+  ./scripts/run_stage.sh ingest --resume
+  ./scripts/run_stage.sh pull-status
   ./scripts/run_stage.sh arxiv-backfill --from 2026-01-01 --until 2026-01-07 --dry-run
   ./scripts/run_stage.sh arxiv-backfill --from 2026-01-01 --until 2026-08-31
+  ./scripts/run_stage.sh arxiv-backfill --resume --until 2026-08-31
   ./scripts/run_stage.sh topics --dry-run
   ./scripts/run_stage.sh topics --limit 100 --allow-paid
   ./scripts/run_stage.sh topics --full --allow-paid

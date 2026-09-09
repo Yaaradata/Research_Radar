@@ -402,6 +402,7 @@ def stage_classify(
             assert_registered(conn, "classify", CLASSIFY_PROMPT_VERSION, CLASSIFY_SYSTEM_PROMPT, model_name=resolve_screen_model())
         except Exception as exc:
             log.warning("prompt registry unavailable: %s", exc)
+            conn.rollback()
 
     candidates = load_quality_candidates(conn, limit=limit)
     if not force:

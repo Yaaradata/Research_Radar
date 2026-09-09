@@ -58,6 +58,15 @@ ARXIV_MAX_RETRIES = int(os.getenv("ARXIV_MAX_RETRIES", "6"))
 ARXIV_WORKERS = int(os.getenv("ARXIV_WORKERS", "4"))
 ARXIV_COMMIT_EVERY = int(os.getenv("ARXIV_COMMIT_EVERY", "10"))
 PIPELINE_WORKERS = int(os.getenv("PIPELINE_WORKERS", str(ARXIV_WORKERS)))
+# Atom API already returns title/abstract/authors/categories. HTML affiliation
+# scrape is the slow path (~1s global throttle per paper). Skip when rushing;
+# affiliation-gpt / independence can still run later.
+ENRICH_SKIP_HTML_AFFILIATION = os.getenv("ENRICH_SKIP_HTML_AFFILIATION", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 MIN_AI_RELEVANCE = float(os.getenv("MIN_AI_RELEVANCE_FOR_ENRICHMENT", "5.0"))
 MIN_CANDIDATE_SCORE = float(os.getenv("MIN_INTRINSIC_CANDIDATE_SCORE", "5.5"))
 SCORE_INCLUDE_PERSON_SIGNAL = os.getenv("SCORE_INCLUDE_PERSON_SIGNAL", "auto").strip().lower()
@@ -102,13 +111,29 @@ def http_get(url, **kwargs):
 
 
 def http_get_retry(url, *, retries=None, sleep_base=None, **kwargs):
-    """GET with backoff for arXiv rate limits (429/5xx)."""
+    """GET with backoff for arXiv rate limits (429/5xx) and transient network errors."""
     retries = ARXIV_MAX_RETRIES if retries is None else retries
     sleep_base = ARXIV_REQUEST_SLEEP if sleep_base is None else sleep_base
     last = None
+    last_exc = None
     for attempt in range(1, retries + 1):
         _arxiv_throttle()
-        last = http_get(url, **kwargs)
+        try:
+            last = http_get(url, **kwargs)
+            last_exc = None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            wait = min(max(sleep_base, 1.0) * (2 ** (attempt - 1)), 90.0)
+            log.warning(
+                "HTTP %s on %s (attempt %d/%d); sleeping %.1fs",
+                exc.__class__.__name__,
+                url.split("?", 1)[0],
+                attempt,
+                retries,
+                wait,
+            )
+            time.sleep(wait)
+            continue
         if last.status_code == 429 or last.status_code >= 500:
             wait = min(max(sleep_base, 1.0) * (2 ** (attempt - 1)), 90.0)
             log.warning(
@@ -122,6 +147,8 @@ def http_get_retry(url, *, retries=None, sleep_base=None, **kwargs):
             time.sleep(wait)
             continue
         return last
+    if last_exc is not None:
+        raise last_exc
     return last
 
 
@@ -1120,6 +1147,11 @@ def start_run(conn, stage):
 
 
 def finish_run(conn, run_id, starting_calls, ok=True, error=None):
+    if not ok:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     if ok:
         conn.execute(
             "UPDATE research_radar.pipeline_runs SET ended_at=NOW(), http_calls=http_calls+%s, status='COMPLETED' WHERE run_id=%s",
@@ -1280,29 +1312,51 @@ def stage_repair_timestamps(conn, run_id, limit=None):
     return updated
 
 
-def stage_relevance(conn, run_id, limit=None, *, reprocess_version: str | None = None):
+def stage_relevance(
+    conn,
+    run_id,
+    limit=None,
+    *,
+    reprocess_version: str | None = None,
+    date_from=None,
+    date_until=None,
+):
     from research_radar.archive import archive_rejected, build_rejected_record
+    from research_radar.candidate_window import format_window_label, published_at_sql_filters
 
     statuses = "('INGESTED', 'RELEVANCE_CHECKED', 'ERROR')"
     if reprocess_version:
         statuses = "('INGESTED', 'RELEVANCE_CHECKED', 'ERROR', 'REJECTED')"
+    window_sql, window_params = published_at_sql_filters(date_from, date_until)
     rows = conn.execute(
         f"""
-        SELECT id, title, summary, categories_raw, source_type,
-               canonical_url,
+        SELECT ci.id, ci.title, ci.summary, ci.categories_raw, ci.source_type,
+               ci.canonical_url, ci.status, ci.relevance_version,
                COALESCE(pm.arxiv_id, NULL) AS arxiv_id,
                COALESCE(pm.abstract, ci.summary, '') AS abstract
         FROM research_radar.content_items ci
         LEFT JOIN research_radar.paper_metadata pm ON pm.content_id = ci.id
         WHERE ci.status IN {statuses}
-        ORDER BY ci.id
+        {window_sql}
+        ORDER BY ci.published_at DESC NULLS LAST, ci.id DESC
         LIMIT %s
         """,
-        (limit or 10_000,),
+        (*window_params, limit or 10_000),
     ).fetchall()
     if reprocess_version:
-        rows = [r for r in rows if r.get("relevance_version") is None or r["relevance_version"] != reprocess_version or r.get("status") == "REJECTED"][:limit or 10_000]
-    log.info("Relevance: processing %d items (reprocess_version=%s)", len(rows), reprocess_version)
+        rows = [
+            r
+            for r in rows
+            if r.get("relevance_version") is None
+            or r["relevance_version"] != reprocess_version
+            or r.get("status") == "REJECTED"
+        ][: limit or 10_000]
+    log.info(
+        "Relevance: processing %d items window=%s reprocess_version=%s",
+        len(rows),
+        format_window_label(date_from, date_until),
+        reprocess_version,
+    )
 
     reject_records = []
     reject_ids = []
@@ -1350,25 +1404,31 @@ def stage_relevance(conn, run_id, limit=None, *, reprocess_version: str | None =
     return len(rows)
 
 
-def stage_enrich(conn, run_id, limit=None):
+def stage_enrich(conn, run_id, limit=None, *, date_from=None, date_until=None):
+    from research_radar.candidate_window import format_window_label, published_at_sql_filters
+
+    window_sql, window_params = published_at_sql_filters(date_from, date_until)
     rows = conn.execute(
-        """
-        SELECT id, title, summary, authors_raw, categories_raw, source_type, canonical_url
-        FROM research_radar.content_items
-        WHERE status IN ('RELEVANT', 'ERROR')
-          AND source_type = 'arxiv'
-        ORDER BY id
+        f"""
+        SELECT ci.id, ci.title, ci.summary, ci.authors_raw, ci.categories_raw, ci.source_type, ci.canonical_url
+        FROM research_radar.content_items ci
+        WHERE ci.status IN ('RELEVANT', 'ERROR')
+          AND ci.source_type = 'arxiv'
+          {window_sql}
+        ORDER BY ci.published_at DESC NULLS LAST, ci.id DESC
         LIMIT %s
         """,
-        (limit or 10_000,),
+        (*window_params, limit or 10_000),
     ).fetchall()
     workers = max(1, ARXIV_WORKERS)
     commit_every = max(1, ARXIV_COMMIT_EVERY)
     log.info(
-        "Enrich: processing %d arXiv items workers=%d commit_every=%d",
+        "Enrich: processing %d arXiv items window=%s workers=%d commit_every=%d skip_html_aff=%s",
         len(rows),
+        format_window_label(date_from, date_until),
         workers,
         commit_every,
+        ENRICH_SKIP_HTML_AFFILIATION,
     )
 
     done = 0
@@ -1386,16 +1446,31 @@ def stage_enrich(conn, run_id, limit=None):
             id_list.append(aid)
             row_by_arxiv[aid] = (row, ver)
 
-        try:
-            meta_by_id = enrich_arxiv_atom_batch(id_list)
-        except Exception as exc:
-            log.exception("Batch Atom fetch failed for %d ids; falling back per-item", len(id_list))
-            meta_by_id = {}
-            for aid in id_list:
-                try:
-                    meta_by_id.update(enrich_arxiv_atom_batch([aid]))
-                except Exception:
-                    log.warning("Atom fetch failed for %s: %s", aid, exc)
+        # Retry the batch on transient/rate-limit failures. Never fall back to
+        # per-id Atom calls — that multiplies request volume and worsens 429s.
+        meta_by_id = {}
+        for batch_attempt in range(1, 4):
+            try:
+                meta_by_id = enrich_arxiv_atom_batch(id_list)
+                break
+            except Exception as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                cool = 90.0 if status == 429 else 30.0
+                if batch_attempt < 3:
+                    log.warning(
+                        "Batch Atom fetch failed for %d ids (%s); cooling %.0fs then retry %d/3",
+                        len(id_list),
+                        status or exc.__class__.__name__,
+                        cool,
+                        batch_attempt + 1,
+                    )
+                    time.sleep(cool)
+                    continue
+                log.exception(
+                    "Batch Atom fetch failed for %d ids after retries; leaving batch for later",
+                    len(id_list),
+                )
+                meta_by_id = {}
 
         def _work(aid: str):
             row, ver = row_by_arxiv[aid]
@@ -1405,7 +1480,10 @@ def stage_enrich(conn, run_id, limit=None):
             if ver is not None:
                 base = dict(base)
                 base["arxiv_version"] = ver
-            emails, affs, evidence_url = extract_arxiv_affiliations(aid)
+            if ENRICH_SKIP_HTML_AFFILIATION:
+                emails, affs, evidence_url = [], [], None
+            else:
+                emails, affs, evidence_url = extract_arxiv_affiliations(aid)
             enriched = dict(base)
             enriched["emails"] = emails
             enriched["affiliation_text"] = affs
@@ -1493,27 +1571,32 @@ def _load_enriched_payload(conn, row):
     }
 
 
-def stage_entities(conn, run_id, limit=None):
+def stage_entities(conn, run_id, limit=None, *, date_from=None, date_until=None):
+    from research_radar.candidate_window import format_window_label, published_at_sql_filters
+
     orgs = [dict(o) for o in load_orgs(conn)]
     people = [dict(p) for p in load_people(conn)]
+    window_sql, window_params = published_at_sql_filters(date_from, date_until)
     rows = [
         dict(r)
         for r in conn.execute(
-            """
-            SELECT id, title, summary, authors_raw, categories_raw, source_type, status
-            FROM research_radar.content_items
-            WHERE status IN ('RELEVANT', 'ENRICHED', 'ERROR')
-            ORDER BY id
+            f"""
+            SELECT ci.id, ci.title, ci.summary, ci.authors_raw, ci.categories_raw, ci.source_type, ci.status
+            FROM research_radar.content_items ci
+            WHERE ci.status IN ('RELEVANT', 'ENRICHED', 'ERROR')
+              {window_sql}
+            ORDER BY ci.published_at DESC NULLS LAST, ci.id DESC
             LIMIT %s
             """,
-            (limit or 10_000,),
+            (*window_params, limit or 10_000),
         ).fetchall()
     ]
     workers = max(1, PIPELINE_WORKERS)
     commit_every = max(1, ARXIV_COMMIT_EVERY)
     log.info(
-        "Entities: processing %d items workers=%d commit_every=%d (orgs=%d people=%d)",
+        "Entities: processing %d items window=%s workers=%d commit_every=%d (orgs=%d people=%d)",
         len(rows),
+        format_window_label(date_from, date_until),
         workers,
         commit_every,
         len(orgs),
@@ -2182,11 +2265,18 @@ def run_stage(
             if stage == "ingest":
                 stage_ingest(conn, run_id, limit=limit, resume=resume)
             elif stage == "relevance":
-                stage_relevance(conn, run_id, limit=limit, reprocess_version=reprocess_version)
+                stage_relevance(
+                    conn,
+                    run_id,
+                    limit=limit,
+                    reprocess_version=reprocess_version,
+                    date_from=date_from,
+                    date_until=date_until,
+                )
             elif stage == "enrich":
-                stage_enrich(conn, run_id, limit=limit)
+                stage_enrich(conn, run_id, limit=limit, date_from=date_from, date_until=date_until)
             elif stage == "entities":
-                stage_entities(conn, run_id, limit=limit)
+                stage_entities(conn, run_id, limit=limit, date_from=date_from, date_until=date_until)
             elif stage == "entities-reprocess":
                 stage_entities_reprocess(conn, run_id, limit=limit)
             elif stage == "repair-timestamps":
@@ -2367,9 +2457,16 @@ def run_stage(
                 # manual/legacy use, but final ranking now comes from
                 # screen -> semantic-score -> independence -> final-score.
                 stage_ingest(conn, run_id, limit=limit, resume=resume)
-                stage_relevance(conn, run_id, limit=limit, reprocess_version=reprocess_version)
-                stage_enrich(conn, run_id, limit=limit)
-                stage_entities(conn, run_id, limit=limit)
+                stage_relevance(
+                    conn,
+                    run_id,
+                    limit=limit,
+                    reprocess_version=reprocess_version,
+                    date_from=date_from,
+                    date_until=date_until,
+                )
+                stage_enrich(conn, run_id, limit=limit, date_from=date_from, date_until=date_until)
+                stage_entities(conn, run_id, limit=limit, date_from=date_from, date_until=date_until)
             else:
                 raise ValueError(f"Unknown stage: {stage}")
             finish_run(conn, run_id, starting_calls, ok=True)
@@ -2486,14 +2583,14 @@ def main():
         dest="date_from",
         type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
         default=None,
-        help="arxiv-backfill: start date (inclusive), ISO YYYY-MM-DD",
+        help="published_at lower bound (inclusive), ISO YYYY-MM-DD — relevance/enrich/entities and arxiv-backfill",
     )
     ap.add_argument(
         "--until",
         dest="date_until",
         type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
         default=None,
-        help="arxiv-backfill: end date (inclusive), ISO YYYY-MM-DD",
+        help="published_at upper bound (inclusive of whole day), ISO YYYY-MM-DD — relevance/enrich/entities and arxiv-backfill",
     )
     ap.add_argument(
         "--resume",

@@ -1791,10 +1791,12 @@ def stage_semantic_score_v2(
             assert_registered(conn, "semantic-score", QUALITY_PROMPT_VERSION, QUALITY_SYSTEM_PROMPT, model_name=resolve_model_name())
         except Exception as exc:
             log.warning("prompt registry unavailable: %s", exc)
+            conn.rollback()
         try:
             archive_screen_gate_drops(conn, run_id, gate_percentile=gate_percentile)
         except Exception as exc:
             log.warning("archive_screen_gate_drops failed (non-fatal): %s", exc)
+            conn.rollback()
 
     candidates = load_gated_quality_candidates(conn, gate_percentile=gate_percentile)
     if not force:
@@ -2322,6 +2324,7 @@ def stage_screen(
             assert_registered(conn, "screen", SCREEN_PROMPT_VERSION, SCREEN_SYSTEM_PROMPT, model_name=resolve_screen_model())
         except Exception as exc:
             log.warning("prompt registry unavailable: %s", exc)
+            conn.rollback()
 
     candidates = load_quality_candidates(conn, limit=limit)
     if not force:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
+
+log = logging.getLogger("research_radar")
 
 PULL_OVERLAP_HOURS = float(os.getenv("PULL_OVERLAP_HOURS", "24"))
 
@@ -13,19 +16,38 @@ SOURCE_INOREADER = "inoreader"
 SOURCE_ARXIV_OAI = "arxiv_oai"
 
 
+def _pull_state_unavailable(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    msg = str(exc).lower()
+    return name in {"UndefinedTable", "ProgrammingError"} and "pull_state" in msg
+
+
 def mark_run_started(conn, source: str, run_id: UUID) -> None:
-    conn.execute(
-        """
-        INSERT INTO research_radar.pull_state (
-            source, last_run_started_at, last_run_id, updated_at
-        ) VALUES (%s, NOW(), %s, NOW())
-        ON CONFLICT (source) DO UPDATE SET
-            last_run_started_at = EXCLUDED.last_run_started_at,
-            last_run_id = EXCLUDED.last_run_id,
-            updated_at = NOW()
-        """,
-        (source, str(run_id)),
-    )
+    try:
+        conn.execute(
+            """
+            INSERT INTO research_radar.pull_state (
+                source, last_run_started_at, last_run_id, updated_at
+            ) VALUES (%s, NOW(), %s, NOW())
+            ON CONFLICT (source) DO UPDATE SET
+                last_run_started_at = EXCLUDED.last_run_started_at,
+                last_run_id = EXCLUDED.last_run_id,
+                updated_at = NOW()
+            """,
+            (source, str(run_id)),
+        )
+    except Exception as exc:
+        if _pull_state_unavailable(exc):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            log.warning(
+                "pull_state missing — apply sql/016_pull_state.sql; continuing without watermark (%s)",
+                exc,
+            )
+            return
+        raise
 
 
 def mark_run_completed(
@@ -42,56 +64,88 @@ def mark_run_completed(
     last_published_at uses GREATEST so a partial newer window never rewinds,
     and NULL input leaves the prior watermark untouched.
     """
-    conn.execute(
-        """
-        INSERT INTO research_radar.pull_state (
-            source, last_run_started_at, last_run_completed_at, last_run_id,
-            last_published_at, last_external_id, items_last_run, items_total, updated_at
-        ) VALUES (
-            %s, NOW(), NOW(), %s, %s, %s, %s, %s, NOW()
-        )
-        ON CONFLICT (source) DO UPDATE SET
-            last_run_completed_at = NOW(),
-            last_run_id = EXCLUDED.last_run_id,
-            last_published_at = CASE
-                WHEN EXCLUDED.last_published_at IS NULL THEN research_radar.pull_state.last_published_at
-                WHEN research_radar.pull_state.last_published_at IS NULL THEN EXCLUDED.last_published_at
-                ELSE GREATEST(
-                    research_radar.pull_state.last_published_at,
-                    EXCLUDED.last_published_at
-                )
-            END,
-            last_external_id = COALESCE(
-                EXCLUDED.last_external_id,
-                research_radar.pull_state.last_external_id
+    try:
+        conn.execute(
+            """
+            INSERT INTO research_radar.pull_state (
+                source, last_run_started_at, last_run_completed_at, last_run_id,
+                last_published_at, last_external_id, items_last_run, items_total, updated_at
+            ) VALUES (
+                %s, NOW(), NOW(), %s, %s, %s, %s, %s, NOW()
+            )
+            ON CONFLICT (source) DO UPDATE SET
+                last_run_completed_at = NOW(),
+                last_run_id = EXCLUDED.last_run_id,
+                last_published_at = CASE
+                    WHEN EXCLUDED.last_published_at IS NULL THEN research_radar.pull_state.last_published_at
+                    WHEN research_radar.pull_state.last_published_at IS NULL THEN EXCLUDED.last_published_at
+                    ELSE GREATEST(
+                        research_radar.pull_state.last_published_at,
+                        EXCLUDED.last_published_at
+                    )
+                END,
+                last_external_id = COALESCE(
+                    EXCLUDED.last_external_id,
+                    research_radar.pull_state.last_external_id
+                ),
+                items_last_run = EXCLUDED.items_last_run,
+                items_total = research_radar.pull_state.items_total + EXCLUDED.items_last_run,
+                updated_at = NOW()
+            """,
+            (
+                source,
+                str(run_id),
+                last_published_at,
+                last_external_id,
+                int(items_last_run),
+                int(items_last_run),
             ),
-            items_last_run = EXCLUDED.items_last_run,
-            items_total = research_radar.pull_state.items_total + EXCLUDED.items_last_run,
-            updated_at = NOW()
-        """,
-        (
-            source,
-            str(run_id),
-            last_published_at,
-            last_external_id,
-            int(items_last_run),
-            int(items_last_run),
-        ),
-    )
+        )
+    except Exception as exc:
+        if _pull_state_unavailable(exc):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            log.warning(
+                "pull_state missing — apply sql/016_pull_state.sql; skip watermark update (%s)",
+                exc,
+            )
+            return
+        raise
 
 
 def get_pull_state(conn, source: str) -> dict[str, Any] | None:
-    row = conn.execute(
-        "SELECT * FROM research_radar.pull_state WHERE source = %s",
-        (source,),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT * FROM research_radar.pull_state WHERE source = %s",
+            (source,),
+        ).fetchone()
+    except Exception as exc:
+        if _pull_state_unavailable(exc):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return None
+        raise
     return dict(row) if row else None
 
 
 def list_pull_states(conn) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        "SELECT * FROM research_radar.pull_state ORDER BY source"
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM research_radar.pull_state ORDER BY source"
+        ).fetchall()
+    except Exception as exc:
+        if _pull_state_unavailable(exc):
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            log.warning("pull_state missing — apply sql/016_pull_state.sql")
+            return []
+        raise
     return [dict(r) for r in rows]
 
 
